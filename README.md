@@ -1,0 +1,74 @@
+# chalk-harbor
+
+A [Harbor](https://www.harborframework.com/) environment provider that runs each trial in a
+[Chalk](https://chalk.ai) sandbox. Point Harbor at it with `--env`, and a benchmark's task
+containers run on Chalk compute instead of a local Docker daemon.
+
+```bash
+harbor run -p <tasks> -a <agent> -e chalk_harbor:ChalkSandboxEnvironment
+```
+
+## Install
+
+Install it into the same environment as Harbor:
+
+```bash
+uv tool install harbor --with git+https://github.com/chalk-ai/chalk-harbor
+```
+
+Authenticate the way any `chalkcompute` client does: `chalk login`, `CHALK_CLIENT_ID`/`CHALK_CLIENT_SECRET`,
+or `CHALK_WEB_IDENTITY_TOKEN_FILE`, with `CHALK_ENVIRONMENT_ID` choosing the environment.
+
+## Try it
+
+`examples/smoke` holds three tiny tasks with reference solutions, so Harbor's `oracle` agent solves
+them without an LLM:
+
+```bash
+harbor run -p examples/smoke -a oracle -e chalk_harbor:ChalkSandboxEnvironment -n 3 --yes
+```
+
+Each task gets its own sandbox, and the run reports a mean reward of 1.0. `copy-context` checks
+that a Dockerfile `COPY`, followed by a `RUN` that reads the copied file, builds correctly.
+
+## How it works
+
+- **Image:** a task's `docker_image` is used as-is. A single-stage `environment/Dockerfile` is
+  translated into a chalkcompute `Image`: `FROM` becomes the base and every other instruction is
+  replayed in order. `COPY`/`ADD` build context is embedded as a base64 tarball inside a `RUN`
+  step (up to 4 MiB compressed per `COPY`), so later `RUN` steps can see the files.
+- **Exec:** commands run through `bash` when the image has it and `sh` otherwise, as the requested
+  user.
+- **File transfer:** directories move as one tar archive in each direction, which preserves
+  modes and symlinks.
+- **Resources:** CPU and memory follow the task's `[environment]` settings.
+- **Network:** `public` grants all IPv4 egress, `allowlist` maps hostnames and IPv4 CIDRs, and
+  `no-network` grants none.
+
+## Environment kwargs
+
+Pass with `--ek key=value`:
+
+| Kwarg | Meaning |
+| --- | --- |
+| `image_map` | `src=dst[,...]`: rewrite a `FROM` or `docker_image` reference, e.g. to a prebuilt image. |
+| `entrypoint` | JSON list run as the sandbox's main process instead of `sleep infinity`. |
+| `ready_command` | Shell command polled after start until it exits 0, e.g. to wait for entrypoint services. |
+| `volumes` | `name:/path[,...]`: existing Chalk volumes to mount, for data too large to bake into an image. |
+| `lifetime` | Maximum sandbox lifetime (default `3600s`), so a crashed run doesn't leak sandboxes. |
+
+## Differences from Docker
+
+- **The image's `ENTRYPOINT`/`CMD` does not run.** A sandbox's main process is `sleep infinity`
+  unless `entrypoint` says otherwise. Tasks whose image starts a service need `entrypoint`, and
+  usually `ready_command`.
+- **Build-time writes under `/workspace` are discarded.** `COPY` into `/workspace` is staged under
+  `/opt/.harbor-workspace` and restored when the sandbox starts. `RUN` steps that write there are
+  still lost, so move that work elsewhere.
+- **Memory is raised to 2 GiB per CPU** when a task asks for less, the sandbox service's minimum.
+- **Only single-stage Dockerfiles work, with no docker-compose sidecars.** The network policy is
+  fixed when the sandbox is created, so it can't change between the agent and verifier phases.
+
+## License
+
+Apache-2.0
