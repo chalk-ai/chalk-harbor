@@ -45,6 +45,29 @@ that a Dockerfile `COPY`, followed by a `RUN` that reads the copied file, builds
 - **Network:** `public` grants all IPv4 egress, `allowlist` maps hostnames and IPv4 CIDRs, and
   `no-network` grants none.
 
+## Traces
+
+Harbor emits no telemetry, and the agent runs inside the trial's sandbox, so nothing it does
+reaches the tracer of the process that launched the trial. `emit_trial_spans(trial_dir)`
+replays a finished trial's record as OpenInference spans, with the original timestamps,
+under whatever span is current:
+
+- a `harbor.trial` span (AGENT) for the whole trial, with the instruction, final message and
+  reward, and one child per phase: environment setup, agent setup, agent execution, verifier;
+- an LLM span per agent turn, with model, token counts and cost;
+- a TOOL span per tool call, with its arguments and observation.
+
+```python
+from chalk_harbor import emit_trial_spans
+
+emit_trial_spans("jobs/<job>/<trial>", instruction=open("tasks/<task>/instruction.md").read())
+```
+
+Called from inside a Chalk evaluation task, the spans land in that row's session, so the row's
+trace shows the trial. Per-turn spans need an agent that writes an ATIF trajectory
+(`agent/trajectory.json`), such as codex, claude-code or terminus. The `oracle` agent writes
+none, so its trials show only the phases.
+
 ## Environment kwargs
 
 Pass with `--ek key=value`:
