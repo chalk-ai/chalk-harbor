@@ -60,7 +60,9 @@ under whatever span is current:
 ```python
 from chalk_harbor import emit_trial_spans
 
-emit_trial_spans("jobs/<job>/<trial>", instruction=open("tasks/<task>/instruction.md").read())
+emit_trial_spans(
+    "jobs/<job>/<trial>", instruction=open("tasks/<task>/instruction.md").read()
+)
 ```
 
 Called from inside a Chalk evaluation task, the spans land in that row's session, so the row's

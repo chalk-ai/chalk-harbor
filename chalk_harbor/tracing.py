@@ -185,9 +185,7 @@ def _sum(*values: int | None) -> int | None:
 def _ns(timestamp: str | None) -> int | None:
     if not timestamp:
         return None
-    return int(
-        datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp() * 1e9
-    )
+    return int(datetime.fromisoformat(timestamp).timestamp() * 1e9)
 
 
 __all__ = ["emit_trial_spans"]
