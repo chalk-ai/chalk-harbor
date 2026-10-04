@@ -34,7 +34,9 @@ import chalkcompute
 from chalkcompute import EvaluationScorerResult, Image, Secret
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[1]
+# The image is built from the local checkout; inside the deployed function this module sits
+# near the filesystem root, where the repository layout does not exist and is not needed.
+REPO = HERE.parents[1] if len(HERE.parents) > 1 else HERE
 TASKS = HERE / "tasks"
 VOLUME = "harbor-traces"
 AGENT = "terminus-2"
@@ -60,17 +62,39 @@ def _copy_regular_files(source: Path, destination: Path) -> None:
             shutil.copy2(path, target)
 
 
+def _upload_with_retry(staged: Path, volume_path: str) -> str | None:
+    """Upload a row's record, returning the last error if every attempt failed.
+
+    Rows that finish together all commit to the volume's ``main`` ref at once, and the volume
+    service gives up on a commit after a few rebases; spreading the retries out lets them land.
+    """
+    import random
+
+    error = None
+    for attempt in range(8):
+        try:
+            with chalkcompute.Volume(VOLUME) as volume:
+                volume.put_dir(staged, volume_path)
+            return None
+        except Exception as exc:  # noqa: BLE001 - reported in the row, not fatal to scoring
+            error = f"{type(exc).__name__}: {exc}"[:1000]
+            time.sleep(random.uniform(1, 4) * (attempt + 1))
+    return error
+
+
 @chalkcompute.function(
     name="harbor-aime-trial",
     image=IMAGE,
     chalk_identity=True,
     secrets=[Secret.from_chalk_env("OPENAI_API_KEY")],
     env={"HARBOR_TRACE_TAG": TAG, "HARBOR_MODEL": "openai/gpt-5-mini"},
-    concurrency=30,
-    min_replicas=3,
-    max_replicas=3,
-    cpu="2",
-    memory="8Gi",
+    concurrency=32,
+    # Each row runs its own `harbor run` process, whose startup alone is CPU-bound for tens of
+    # seconds; 8 rows per 4-CPU replica keeps that from dominating the trial.
+    min_replicas=4,
+    max_replicas=4,
+    cpu="4",
+    memory="16Gi",
     call_timeout=900,
 )
 def harbor_aime_trial(task_name: str) -> str:
@@ -130,12 +154,7 @@ def harbor_aime_trial(task_name: str) -> str:
             (staged / "task" / name).parent.mkdir(parents=True, exist_ok=True)
             (staged / "task" / name).write_text((task_dir / name).read_text())
     volume_path = f"{os.environ['HARBOR_TRACE_TAG']}/{task_name}"
-    upload_error = None
-    try:
-        with chalkcompute.Volume(VOLUME) as volume:
-            volume.put_dir(staged, volume_path)
-    except Exception as exc:  # noqa: BLE001 - reported in the row, not fatal to scoring
-        upload_error = f"{type(exc).__name__}: {exc}"[:1000]
+    upload_error = _upload_with_retry(staged, volume_path)
 
     if not trials:
         return json.dumps(
