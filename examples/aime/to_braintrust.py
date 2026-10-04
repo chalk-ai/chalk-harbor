@@ -306,8 +306,7 @@ def main(argv: list[str]) -> int:
     if args.jsonl or not os.environ.get("BRAINTRUST_API_KEY"):
         path = args.jsonl or f"{args.tag}.braintrust.jsonl"
         with open(path, "w") as out:
-            for row in rows:
-                out.write(json.dumps(row) + "\n")
+            out.writelines(json.dumps(row) + "\n" for row in rows)
         print(f"wrote {path} (set BRAINTRUST_API_KEY to upload)")
         return 0
     print("experiment:", upload(rows, manifest, args.project))
