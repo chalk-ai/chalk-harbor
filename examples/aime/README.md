@@ -12,8 +12,9 @@ harbor download aime@1.0 -o /tmp/aime && mv /tmp/aime/aime tasks
 Every row keeps Harbor's native record. The trial directory exactly as Harbor wrote it goes to
 the `harbor-traces` volume under `<tag>/<task>/`: `result.json`, the ATIF
 `agent/trajectory.json`, the asciinema recording, verifier output, plus the task's problem and
-answer key and a `chalk.json` naming the row's session. The same record is replayed as spans
-into the row's Chalk trace (`chalk_harbor.tracing`). At the end, `<tag>/manifest.json` holds the
+answer key and a `chalk.json` naming the row's session. While the trial runs, each agent turn
+and command is streamed as a span into the row's Chalk trace (`chalk_harbor.stream_trial_spans`),
+tagged with `chalk.evaluation.id` and `chalk.evaluation.run_id`. At the end, `<tag>/manifest.json` holds the
 evaluation and run ids and every row's result.
 
 ## Comparing in Braintrust

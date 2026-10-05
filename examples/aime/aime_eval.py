@@ -15,7 +15,8 @@ model, a Chalk sandbox as the environment) and then:
 * uploads the trial directory exactly as Harbor wrote it -- result.json, the ATIF
   agent/trajectory.json, agent and verifier logs -- to the ``harbor-traces`` volume under
   ``<tag>/<task>/``, next to a ``chalk.json`` naming the evaluation, run and row session;
-* replays the same record as spans under the row's session, so the Chalk trace shows it.
+* streams the trial as spans into the row's session while it runs, one per agent turn and
+  command, each tagged with the evaluation and run, so the Chalk trace shows it live.
 
 The model key comes from the environment's OPENAI_API_KEY Chalk secret, injected by name.
 At the end the script writes ``<tag>/manifest.json`` (evaluation and run ids, per-task
@@ -104,7 +105,7 @@ def harbor_aime_trial(task_name: str) -> str:
     import uuid
 
     sys.path.insert(0, "/opt/harbor")
-    from chalk_harbor.tracing import emit_trial_spans
+    from chalk_harbor.tracing import stream_trial_spans
 
     job = f"{task_name}-{uuid.uuid4().hex[:6]}"
     jobs_dir = Path(tempfile.mkdtemp(prefix="harbor-jobs-"))
@@ -116,15 +117,22 @@ def harbor_aime_trial(task_name: str) -> str:
         "--agent-timeout-multiplier", "0.08",
         "-o", str(jobs_dir), "--job-name", job, "--yes",
     ]  # fmt: skip
+    instruction = Path("/opt/harbor/tasks", task_name, "instruction.md")
     started = time.time()
-    proc = subprocess.run(
-        command,
-        env={**os.environ, "PYTHONPATH": "/opt/harbor"},
-        capture_output=True,
-        text=True,
-        timeout=840,
-        check=False,
-    )
+    # Each agent turn reaches the row's trace as soon as Harbor records it, tagged with the
+    # evaluation and run, so a trial can be watched while the evaluation is still running.
+    with stream_trial_spans(
+        jobs_dir / job,
+        instruction=instruction.read_text() if instruction.exists() else None,
+    ):
+        proc = subprocess.run(
+            command,
+            env={**os.environ, "PYTHONPATH": "/opt/harbor"},
+            capture_output=True,
+            text=True,
+            timeout=840,
+            check=False,
+        )
     wall = round(time.time() - started, 1)
     trials = sorted((jobs_dir / job).glob("*/result.json"))
     context = dict(chalkcompute.get_call_context())
@@ -166,11 +174,6 @@ def harbor_aime_trial(task_name: str) -> str:
             }
         )
     result = json.loads(trials[0].read_text())
-    instruction = Path("/opt/harbor/tasks", task_name, "instruction.md")
-    emit_trial_spans(
-        trials[0].parent,
-        instruction=instruction.read_text() if instruction.exists() else None,
-    )
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
     exception = result.get("exception_info") or {}
     agent_result = result.get("agent_result") or {}
