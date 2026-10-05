@@ -48,27 +48,37 @@ that a Dockerfile `COPY`, followed by a `RUN` that reads the copied file, builds
 ## Traces
 
 Harbor emits no telemetry, and the agent runs inside the trial's sandbox, so nothing it does
-reaches the tracer of the process that launched the trial. `emit_trial_spans(trial_dir)`
-replays a finished trial's record as OpenInference spans, with the original timestamps,
-under whatever span is current:
+reaches the tracer of the process that launched the trial. `chalk_harbor.tracing` turns the
+trial's own record into OpenInference spans, with the original timestamps, under whatever span
+is current:
 
 - a `harbor.trial` span (AGENT) for the whole trial, with the instruction, final message and
   reward, and one child per phase: environment setup, agent setup, agent execution, verifier;
 - an LLM span per agent turn, with model, token counts and cost;
 - a TOOL span per tool call, with its arguments and observation.
 
-```python
-from chalk_harbor import emit_trial_spans
+**Live, while the trial runs.** Wrap the `harbor run` in `stream_trial_spans`, pointed at the
+job directory it writes. Harbor rewrites `agent/trajectory.json` after every step, so each
+turn's LLM span is exported as soon as the turn is recorded, and its tool spans once the next
+step starts. The trial and agent-execution spans end, and arrive, when the trial does; a trace
+viewer that hangs spans with a missing parent under a synthetic root shows the agent's
+progress as it happens.
 
-emit_trial_spans(
-    "jobs/<job>/<trial>", instruction=open("tasks/<task>/instruction.md").read()
-)
+```python
+from chalk_harbor import stream_trial_spans
+
+with stream_trial_spans(f"jobs/{job}", instruction=open("tasks/<task>/instruction.md").read()):
+    subprocess.run(["harbor", "run", ..., "-o", "jobs", "--job-name", job])
 ```
 
+**Afterwards.** `emit_trial_spans("jobs/<job>/<trial>")` replays a finished trial in one go.
+
 Called from inside a Chalk evaluation task, the spans land in that row's session, so the row's
-trace shows the trial. Per-turn spans need an agent that writes an ATIF trajectory
-(`agent/trajectory.json`), such as codex, claude-code or terminus. The `oracle` agent writes
-none, so its trials show only the phases.
+trace shows the trial. Every span also carries `chalk.evaluation.id` and
+`chalk.evaluation.run_id` from the call's evaluation metadata (`evaluation_attributes()`), so a
+run's trials can be found by run id while the run is still going. Per-turn spans need an agent
+that writes an ATIF trajectory (`agent/trajectory.json`), such as codex, claude-code or
+terminus. The `oracle` agent writes none, so its trials show only the phases.
 
 ## Environment kwargs
 
