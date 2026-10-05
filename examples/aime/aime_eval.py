@@ -105,6 +105,7 @@ def harbor_aime_trial(task_name: str) -> str:
     import uuid
 
     sys.path.insert(0, "/opt/harbor")
+    from chalk_harbor.evaluation import evaluation_env
     from chalk_harbor.tracing import stream_trial_spans
 
     job = f"{task_name}-{uuid.uuid4().hex[:6]}"
@@ -127,7 +128,8 @@ def harbor_aime_trial(task_name: str) -> str:
     ):
         proc = subprocess.run(
             command,
-            env={**os.environ, "PYTHONPATH": "/opt/harbor"},
+            # The evaluation, run and row, for the trial's sandbox tags (sandbox_tags).
+            env={**os.environ, **evaluation_env(), "PYTHONPATH": "/opt/harbor"},
             capture_output=True,
             text=True,
             timeout=840,
