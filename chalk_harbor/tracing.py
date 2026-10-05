@@ -47,15 +47,17 @@ from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import Span, Status, StatusCode
 
+from chalk_harbor.evaluation import evaluation_context
+
 _TRACER_NAME = "chalk_harbor"
 # Attribute values are capped so one huge observation cannot blow the span size limit.
 _MAX_VALUE_CHARS = 16_000
 _SETUP_PHASES = ("environment_setup", "agent_setup")
-# Call metadata a Chalk evaluation attaches to every task and scorer call, and the span
-# attribute each is recorded as.
-_EVALUATION_HEADERS = {
-    "x-chalk-evaluation-id": "chalk.evaluation.id",
-    "x-chalk-evaluation-run-id": "chalk.evaluation.run_id",
+# The span attribute each part of the evaluation context is recorded as. The session needs
+# none: chalkcompute stamps every span in a row's session with it already.
+_EVALUATION_ATTRIBUTES = {
+    "evaluation_id": "chalk.evaluation.id",
+    "evaluation_run_id": "chalk.evaluation.run_id",
 }
 
 
@@ -64,15 +66,11 @@ def evaluation_attributes() -> dict[str, str]:
 
     Empty outside a Chalk evaluation, or where chalkcompute is not installed.
     """
-    try:
-        import chalkcompute
-    except ImportError:
-        return {}
-    call_context = chalkcompute.get_call_context()
+    context = evaluation_context()
     return {
-        attribute: call_context[header]
-        for header, attribute in _EVALUATION_HEADERS.items()
-        if call_context.get(header)
+        attribute: context[key]
+        for key, attribute in _EVALUATION_ATTRIBUTES.items()
+        if key in context
     }
 
 
