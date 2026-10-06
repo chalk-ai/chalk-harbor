@@ -1,0 +1,2 @@
+#!/bin/sh
+PYTHONPATH="${HELPDESK_HOME:-/opt/helpdesk}/lib" exec python3 -m helpdesk.cli "$@"
