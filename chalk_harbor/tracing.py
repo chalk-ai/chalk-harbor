@@ -40,6 +40,7 @@ Inside a Chalk evaluation, every span also carries the evaluation and run it bel
 
 from __future__ import annotations
 
+import contextvars
 import json
 import threading
 import time
@@ -331,8 +332,16 @@ class _TrialStreamer:
         self._emitted_turns: set[int] = set()
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # Span processors read the context current where a span starts, not the span's parent:
+        # chalkcompute stamps each span with the row's session from the OTel baggage it finds
+        # there. A new thread starts with an empty context, so the poller runs in a copy of the
+        # caller's, or every span it emits lands outside the row's session.
+        context = contextvars.copy_context()
         self._thread = threading.Thread(
-            target=self._run, name="harbor-trial-spans", daemon=True
+            target=context.run,
+            args=(self._run,),
+            name="harbor-trial-spans",
+            daemon=True,
         )
 
     def start(self) -> None:

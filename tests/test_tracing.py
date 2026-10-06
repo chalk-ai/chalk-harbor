@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from opentelemetry import trace
-from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry import baggage, trace
+from opentelemetry import context as otel_context
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -19,6 +20,23 @@ ATTRIBUTES = {"chalk.evaluation.id": "eval-1", "chalk.evaluation.run_id": "run-1
 _EXPORTER = InMemorySpanExporter()
 _PROVIDER = TracerProvider()
 _PROVIDER.add_span_processor(SimpleSpanProcessor(_EXPORTER))
+
+
+class _BaggageAtStart(SpanProcessor):
+    """Records the ``session.id`` baggage current where each span starts, as chalkcompute reads it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sessions: dict[int, object] = {}
+
+    def on_start(
+        self, span: ReadableSpan, parent_context: otel_context.Context | None = None
+    ) -> None:
+        self.sessions[span.context.span_id] = baggage.get_baggage("session.id")
+
+
+_BAGGAGE = _BaggageAtStart()
+_PROVIDER.add_span_processor(_BAGGAGE)
 trace.set_tracer_provider(_PROVIDER)
 
 
@@ -310,3 +328,39 @@ def test_streaming_waits_for_tool_results_written_after_the_step(
     assert seen[1] == ["bash_command", "openai/gpt-5-mini", "turn 1"]
     tool = next(s for s in exporter.get_finished_spans() if s.name == "bash_command")
     assert tool.attributes["output.value"] == "ok"
+
+
+def test_streamed_spans_start_in_the_callers_context(
+    tmp_path: Path, exporter: InMemorySpanExporter
+) -> None:
+    # chalkcompute stamps a span with the row's session from the baggage current where the span
+    # starts; spans the poller emits on its own thread must see the caller's.
+    job_dir = tmp_path / "job"
+    token = otel_context.attach(baggage.set_baggage("session.id", "run-1:row-7"))
+    try:
+        with stream_trial_spans(
+            job_dir, instruction="problem", attributes=ATTRIBUTES, poll_seconds=0.05
+        ):
+            _write_trial(
+                job_dir / "aime_1__abc", len(TRAJECTORY["steps"]), finished=False
+            )
+            time.sleep(0.3)
+            streamed_before_end = {
+                span.context.span_id for span in exporter.get_finished_spans()
+            }
+            _write_trial(
+                job_dir / "aime_1__abc", len(TRAJECTORY["steps"]), finished=True
+            )
+    finally:
+        otel_context.detach(token)
+
+    assert streamed_before_end, "the poller emitted nothing while the trial ran"
+    spans = exporter.get_finished_spans()
+    assert {span.name for span in spans} >= {
+        "harbor.trial",
+        "openai/gpt-5-mini",
+        "bash_command",
+    }
+    assert {_BAGGAGE.sessions[span.context.span_id] for span in spans} == {
+        "run-1:row-7"
+    }
