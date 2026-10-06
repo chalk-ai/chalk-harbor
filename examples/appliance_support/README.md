@@ -9,6 +9,8 @@ actions cost, and how the customer felt. `support_eval.py` runs all 30 as a Chal
 ./build_tasks.py                      # scenarios.py -> tasks/<id>/
 uv run --with pytest pytest test_scenarios.py   # every rubric gives the reference resolution 1.0
 ./support_eval.py                     # all 30 tickets as a Chalk evaluation (or --only <id> ...)
+./support_eval.py --rescore <run-id>  # score an earlier run's outputs with the current scorers
+./summarize.py runs/<tag>.json        # per-ticket scores as a markdown table
 ```
 
 ## What the agent gets
@@ -110,7 +112,7 @@ holds the details.
 | `larkspur-customer-got-irate` | LLM judge | 1 if the customer became or stayed irate after the agent engaged (lower is better) |
 | `larkspur-customer-satisfied` | LLM judge | end-of-chat CSAT 1–5 judged against what the customer wanted, mapped to 0–1 |
 | `larkspur-csat-survey` | simulated customer | the customer's own post-chat survey answer, 1–5 mapped to 0–1 |
-| `larkspur-agent-claims-accurate` | LLM judge | 1 minus 0.34 per statement to the customer not backed by the ledger or records (e.g. "I've refunded", "we'll cover all costs") |
+| `larkspur-agent-claims-accurate` | LLM judge | 1 minus 0.34 per *material* false statement to the customer, checked against the ledger (with each action's system response), the ticket records and the knowledge base: a technician promised but never dispatched, a wrong fee or posting time, an invented policy |
 
 The judges (`openai/gpt-5.4` by default) run through Chalk's AI router as the environment, so
 no provider key is needed. Cost of service is computed from the ledger rather than by a judge,
@@ -149,3 +151,4 @@ its ticket through `HELPDESK_TICKET` in `task.toml`.
 | `support_agent.py` | the Harbor agent: tool loop, simulated customer, ATIF trajectory |
 | `support_eval.py` | the Chalk evaluation: trial function, scorers, run |
 | `test_scenarios.py` | rubric self-checks against the reference resolutions |
+| `summarize.py` | a run's per-ticket scores as a markdown table |

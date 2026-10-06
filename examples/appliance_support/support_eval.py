@@ -42,7 +42,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import chalkcompute
 from chalkcompute import EvaluationScorerResult, Image
@@ -81,6 +81,12 @@ if (HERE / "support_agent.py").exists():
         .add_local_file(str(HERE / "support_agent.py"), "/opt/harbor/support_agent.py")
     )
 SCORER_IMAGE = Image.debian_slim("3.13").pip_install(["pydantic", "openai"])
+# The claims judge checks the agent's statements against Larkspur's policies.
+KB_IN_IMAGE = "/opt/larkspur-kb"
+if (HERE / "helpdesk" / "kb").is_dir():
+    SCORER_IMAGE = SCORER_IMAGE.add_local_dir(
+        str(HERE / "helpdesk" / "kb"), KB_IN_IMAGE
+    )
 
 
 # -- the task --------------------------------------------------------------------------------
@@ -219,6 +225,7 @@ def larkspur_support_trial(task_name: str) -> str:
             "ok": e.get("ok"),
             "args": e.get("args"),
             "error": e.get("error"),
+            "result": e.get("result"),
         }
         for e in ledger
         if e.get("kind") == "action" and e["tool"] != "send_message_to_customer"
@@ -255,6 +262,7 @@ def larkspur_support_trial(task_name: str) -> str:
             "customer_left": conversation.get("customer_left"),
             "survey": conversation.get("survey"),
             "tokens": conversation.get("tokens"),
+            "ticket_record": instruction.read_text() if instruction.exists() else None,
             "exception": exception.get("exception_type"),
             "exception_message": (exception.get("exception_message") or "")[:1000],
         }
@@ -331,13 +339,29 @@ def _render(output: str, customer_brief: str, *, actions: bool) -> str:
     if actions:
         lines += ["", "## Actions the agent actually took (helpdesk ledger)", ""]
         for action in row.get("actions") or []:
-            status = "ok" if action["ok"] else f"REJECTED: {action.get('error')}"
+            status = (
+                f"ok {json.dumps(action.get('result'))}"
+                if action["ok"]
+                else f"REJECTED: {action.get('error')}"
+            )
             lines.append(
                 f"- {action['tool']} {json.dumps(action.get('args'))} -> {status}"
             )
         if not row.get("actions"):
             lines.append("- (none)")
     lines += ["", "## Background (not visible to the customer)", "", customer_brief]
+    if actions:
+        lines += [
+            "",
+            "## Ticket records the agent was shown (true)",
+            "",
+            row.get("ticket_record") or "(not recorded)",
+        ]
+        kb = sorted(Path(KB_IN_IMAGE).glob("*.md"))
+        if kb:
+            lines += ["", "## Larkspur knowledge base (true policy)", ""] + [
+                path.read_text() for path in kb
+            ]
     return "\n".join(lines)
 
 
@@ -357,12 +381,17 @@ problem solved or a clear, credible next step. Read their last messages closely.
 agent for following policy; judge the customer's experience."""
 
 CLAIMS_INSTRUCTIONS = """\
-Audit the AGENT's messages for statements the customer could rely on that are not true. For each \
-thing the agent said it did, or said will happen (refunds, credits, visits, callbacks, approvals, \
-covering costs, timelines), check it against the actions ledger below: only actions marked ok \
-happened. Also flag amounts, dates or policies stated to the customer that contradict the actions \
-or the background. Do not flag reasonable statements about what the customer can do themselves, \
-or apologies and empathy."""
+Audit the AGENT's messages for MATERIAL statements the customer could rely on that are false. \
+Material means money (amounts, fees, refunds, where and when money posts), eligibility and policy, \
+dates and time windows, visits, callbacks, and who will decide or contact them.
+
+A statement is backed when it matches the final state of the chat: the actions ledger below (only \
+actions marked ok happened; the system's response to each, such as reference numbers, posting \
+times, response times and arrival windows, is what the agent was told and may repeat), the ticket \
+records, or the knowledge base. It does not matter whether the agent said it just before or just \
+after taking the action in the same chat. Do not flag routine process details (confirmation \
+emails, "I've reviewed your order"), what the customer can do themselves, reasonable \
+descriptions of what a visit or team is for, apologies, or empathy. When unsure, do not flag."""
 
 
 class IrateGrade(BaseModel):
@@ -407,19 +436,33 @@ def _satisfied_prompt(response_model: type, output: str, customer_brief: str) ->
     )
 
 
+class Claim(BaseModel):
+    quote: str = Field(description="The agent's words, quoted.")
+    truth: str = Field(
+        description="What the ledger, records or knowledge base actually show."
+    )
+    severity: Literal["material", "minor", "backed"] = Field(
+        description="material: the customer would act on something false (money, eligibility, dates, "
+        + "visits, who decides). minor: imprecise but harmless. backed: on reflection it is true."
+    )
+
+
 class ClaimsGrade(BaseModel):
+    claims: list[Claim] = Field(
+        description="Statements you checked that might be false, each with a verdict."
+    )
     unbacked_claims: list[str] = Field(
-        description="Each statement to the customer that is not backed by a successful action, the records "
-        + "or the background (e.g. 'said a refund was issued but none was', a promise no action supports, "
-        + "a wrong amount or date, an invented policy)."
+        description="Leave empty; filled in from the material claims."
     )
     score: float = Field(
-        description="1 if there are none; minus 0.34 per claim, floored at 0."
+        description="1 if no claim is material; minus 0.34 per material claim, floored at 0."
     )
 
     @model_validator(mode="after")
     def _score(self) -> ClaimsGrade:
-        self.score = max(0.0, round(1.0 - 0.34 * len(self.unbacked_claims), 2))
+        material = [c for c in self.claims if c.severity == "material"]
+        self.unbacked_claims = [f"{c.quote} -- {c.truth}" for c in material]
+        self.score = max(0.0, round(1.0 - 0.34 * len(material), 2))
         return self
 
 
@@ -470,11 +513,55 @@ def _wait(run_id: str, timeout: float) -> chalkcompute.EvaluationRun:
         time.sleep(15)
 
 
+def _save(manifest: dict[str, Any], run: chalkcompute.EvaluationRun) -> Path:
+    rows = []
+    if run.result_dataset is not None:
+        rows = chalkcompute.DatasetClient().read(run.result_dataset).to_pylist()
+    manifest = {
+        **manifest,
+        "status": str(run.status),
+        "columns": list(rows[0]) if rows else [],
+    }
+    with chalkcompute.Volume(VOLUME) as volume:
+        body = json.dumps({**manifest, "rows": rows}, indent=2, default=str).encode()
+        volume.put_file(f"{manifest['tag']}/manifest.json", body)
+    out = HERE / "runs" / f"{manifest['tag']}.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps({**manifest, "rows": rows}, indent=2, default=str))
+    print(json.dumps(manifest, indent=2))
+    print(f"rows written to {out}")
+    return out
+
+
+def _rescore(run_id: str) -> int:
+    for scorer in SCORERS:
+        if hasattr(scorer, "wait_ready"):
+            scorer.wait_ready(timeout=1200)
+    source = chalkcompute.EvaluationRun.from_id(run_id)
+    started = time.time()
+    run = source.rescore(scorers=SCORERS)
+    print(f"rescoring run {run_id} as run {run.id}", flush=True)
+    run = _wait(run.id, timeout=3600)
+    manifest = {"tag": f"{TAG}-rescore", "rescored_run_id": run_id, "agent_model": AGENT_MODEL,
+                "customer_model": CUSTOMER_MODEL, "judge_model": JUDGE_MODEL,
+                "evaluation_id": run.evaluation_id, "evaluation_run_id": run.id,
+                "wall_seconds": round(time.time() - started)}  # fmt: skip
+    _save(manifest, run)
+    return 0 if str(run.status).endswith("SUCCEEDED") else 1
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--only", nargs="*", default=None, help="Task names to run.")
+    parser.add_argument(
+        "--rescore",
+        metavar="RUN_ID",
+        help="Score an earlier run's outputs with the current scorers.",
+    )
     args = parser.parse_args(argv)
+    if args.rescore:
+        return _rescore(args.rescore)
     sys.path.insert(0, str(HERE))
     from scenarios import SCENARIOS
 
@@ -527,31 +614,10 @@ def main(argv: list[str]) -> int:
     wall = round(time.time() - started)
     print(f"status: {run.status} after {wall}s", flush=True)
 
-    rows = []
-    if run.result_dataset is not None:
-        table = chalkcompute.DatasetClient().read(run.result_dataset)
-        rows = table.to_pylist()
-    manifest = {
-        "tag": TAG,
-        "agent_model": AGENT_MODEL,
-        "customer_model": CUSTOMER_MODEL,
-        "judge_model": JUDGE_MODEL,
-        "evaluation_id": evaluation.id,
-        "evaluation_run_id": run.id,
-        "status": str(run.status),
-        "wall_seconds": wall,
-        "columns": list(rows[0]) if rows else [],
-    }
-    with chalkcompute.Volume(VOLUME) as volume:
-        volume.put_file(
-            f"{TAG}/manifest.json",
-            json.dumps({**manifest, "rows": rows}, indent=2, default=str).encode(),
-        )
-    out = HERE / "runs" / f"{TAG}.json"
-    out.parent.mkdir(exist_ok=True)
-    out.write_text(json.dumps({**manifest, "rows": rows}, indent=2, default=str))
-    print(json.dumps(manifest, indent=2))
-    print(f"rows written to {out}")
+    manifest = {"tag": TAG, "agent_model": AGENT_MODEL, "customer_model": CUSTOMER_MODEL,
+                "judge_model": JUDGE_MODEL, "evaluation_id": evaluation.id, "evaluation_run_id": run.id,
+                "wall_seconds": wall}  # fmt: skip
+    _save(manifest, run)
     return 0 if str(run.status).endswith("SUCCEEDED") else 1
 
 
