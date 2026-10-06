@@ -105,7 +105,7 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": {"type": "object", "properties": {
             "order_id": {"type": "string"},
             "amount_usd": {"type": "number"},
-            "reason_code": {"type": "string", "enum": ["delivery_fee", "installation_fee", "haul_away_fee", "price_adjustment", "damage_discount", "goodwill"]},
+            "reason_code": {"type": "string", "enum": ["delivery_fee", "installation_fee", "haul_away_fee", "price_adjustment", "damage_discount", "goodwill", "billing_error"]},
             "note": {"type": "string", "description": "Internal note: why this refund is owed."}},
             "required": ["order_id", "amount_usd", "reason_code", "note"]}}},
     {"type": "function", "function": {

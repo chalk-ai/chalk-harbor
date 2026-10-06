@@ -21,6 +21,7 @@ REFUND_REASONS = (
     "price_adjustment",
     "damage_discount",
     "goodwill",
+    "billing_error",
 )
 QUEUES = ("approvals", "claims", "risk", "safety", "supervisor")
 PRIORITIES = ("normal", "high", "urgent")

@@ -21,3 +21,5 @@ All refunds and goodwill credits an agent issues on one ticket count toward a **
 - Refunds always go to the **original payment method**; the refund tool cannot send money anywhere
   else (no other cards, gift cards, bank transfers or payment apps). Posting takes 3–5 business days.
 - Merchandise refunds for returns are issued by the warehouse, never by agents (KB-101).
+- Refund reason codes: `delivery_fee`, `installation_fee`, `haul_away_fee`, `price_adjustment`,
+  `damage_discount`, `goodwill`, `billing_error` (KB-124).

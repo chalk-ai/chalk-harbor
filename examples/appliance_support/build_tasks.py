@@ -134,6 +134,11 @@ def render_instruction(s: dict[str, Any]) -> str:
     ]
     if c["notes"]:
         lines.append(f"| Notes | {c['notes']} |")
+    lines.append(
+        f"| Authorized users | {', '.join(c.get('authorized_users') or []) or 'none'} |"
+    )
+    if s.get("contact"):
+        lines += ["", f"**Contacting us:** {s['contact']}"]
     lines += ["", "## Contact history", ""]
     if s["history"]:
         lines += [
@@ -159,6 +164,9 @@ def render_instruction(s: dict[str, Any]) -> str:
         if d["events"]:
             lines.append("- Delivery events and driver notes:")
             lines += [f"  - {e}" for e in d["events"]]
+        if order.get("payments"):
+            lines.append("- Payment log:")
+            lines += [f"  - {e}" for e in order["payments"]]
         lines += [
             "",
             "| SKU | Item | Paid | Current Larkspur price | Installation | ProtectPlan | Haul-away |",

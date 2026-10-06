@@ -81,6 +81,8 @@ if (HERE / "support_agent.py").exists():
         .add_local_file(str(HERE / "support_agent.py"), "/opt/harbor/support_agent.py")
     )
 SCORER_IMAGE = Image.debian_slim("3.13").pip_install(["pydantic", "openai"])
+# Scorers handle one row at a time by default, which made scoring a 30-row run take ~100 s.
+SCORER_SCALE = {"concurrency": 32, "min_replicas": 1, "max_replicas": 2}
 # The claims judge checks the agent's statements against Larkspur's policies.
 KB_IN_IMAGE = "/opt/larkspur-kb"
 if (HERE / "helpdesk" / "kb").is_dir():
@@ -142,20 +144,22 @@ def _router_env() -> dict[str, str]:
     name="larkspur-support-trial",
     image=TRIAL_IMAGE,
     chalk_identity=True,
+    # Nothing run-specific belongs in the function's spec (the run's tag arrives per row), so
+    # consecutive runs reuse the deployed version instead of rolling out a new one.
     env={
-        "HARBOR_TRACE_TAG": TAG,
         "LARKSPUR_AGENT_MODEL": AGENT_MODEL,
         "LARKSPUR_CUSTOMER_MODEL": CUSTOMER_MODEL,
     },
+    # 8 replicas x 8 trials covers all 60 tickets at once, and min = max keeps them warm. Each
+    # trial runs its own `harbor run` process, whose startup is CPU-bound, so 8 per 4-CPU replica.
     concurrency=8,
-    # Each row runs its own `harbor run` process, whose startup is CPU-bound for tens of seconds.
-    min_replicas=4,
-    max_replicas=4,
+    min_replicas=8,
+    max_replicas=8,
     cpu="4",
     memory="16Gi",
     call_timeout=1500,
 )
-def larkspur_support_trial(task_name: str) -> str:
+def larkspur_support_trial(task_name: str, run_tag: str) -> str:
     import os
     import subprocess
     import tempfile
@@ -199,12 +203,12 @@ def larkspur_support_trial(task_name: str) -> str:
     trial_dir = trials[0].parent if trials else None
     staged = Path(tempfile.mkdtemp(prefix="harbor-upload-"))
     _copy_regular_files(jobs_dir / job, staged)
-    record = {"task": task_name, "tag": os.environ["HARBOR_TRACE_TAG"], **evaluation_context(),
+    record = {"task": task_name, "tag": run_tag, **evaluation_context(),
               "harbor_exit_code": proc.returncode, "wall_seconds": wall}  # fmt: skip
     (staged / "chalk.json").write_text(json.dumps(record, indent=2))
     (staged / "harbor.stdout.txt").write_text(proc.stdout[-200_000:])
     (staged / "harbor.stderr.txt").write_text(proc.stderr[-200_000:])
-    volume_path = f"{os.environ['HARBOR_TRACE_TAG']}/{task_name}"
+    volume_path = f"{run_tag}/{task_name}"
     upload_error = _upload_with_retry(staged, volume_path)
 
     if trial_dir is None:
@@ -272,7 +276,9 @@ def larkspur_support_trial(task_name: str) -> str:
 # -- deterministic scorers -------------------------------------------------------------------
 
 
-@chalkcompute.function(name="larkspur-policy-compliance", image=SCORER_IMAGE)
+@chalkcompute.function(
+    name="larkspur-policy-compliance", image=SCORER_IMAGE, **SCORER_SCALE
+)
 def policy_compliance(output: str) -> EvaluationScorerResult:
     row = json.loads(output)
     failed = [
@@ -285,7 +291,9 @@ def policy_compliance(output: str) -> EvaluationScorerResult:
     )  # fmt: skip
 
 
-@chalkcompute.function(name="larkspur-cost-of-service", image=SCORER_IMAGE)
+@chalkcompute.function(
+    name="larkspur-cost-of-service", image=SCORER_IMAGE, **SCORER_SCALE
+)
 def cost_of_service(output: str) -> EvaluationScorerResult:
     row = json.loads(output)
     cost, reference = row.get("cost_of_service_usd"), row.get("reference_cost_usd")
@@ -301,7 +309,7 @@ def cost_of_service(output: str) -> EvaluationScorerResult:
     )  # fmt: skip
 
 
-@chalkcompute.function(name="larkspur-csat-survey", image=SCORER_IMAGE)
+@chalkcompute.function(name="larkspur-csat-survey", image=SCORER_IMAGE, **SCORER_SCALE)
 def csat_survey(output: str) -> EvaluationScorerResult:
     survey = json.loads(output).get("survey") or {}
     try:
@@ -472,15 +480,15 @@ def _claims_prompt(response_model: type, output: str, customer_brief: str) -> st
 
 customer_got_irate = cc_scorers.llm_judge(
     IrateGrade, model=JUDGE_MODEL, name="larkspur-customer-got-irate", inputs=("output", "customer_brief"),
-    prompt_fn=_irate_prompt, image=SCORER_IMAGE,
+    prompt_fn=_irate_prompt, image=SCORER_IMAGE, **SCORER_SCALE,
 )  # fmt: skip
 customer_satisfied = cc_scorers.llm_judge(
     SatisfactionGrade, model=JUDGE_MODEL, name="larkspur-customer-satisfied", inputs=("output", "customer_brief"),
-    prompt_fn=_satisfied_prompt, image=SCORER_IMAGE,
+    prompt_fn=_satisfied_prompt, image=SCORER_IMAGE, **SCORER_SCALE,
 )  # fmt: skip
 agent_claims_accurate = cc_scorers.llm_judge(
     ClaimsGrade, model=JUDGE_MODEL, name="larkspur-agent-claims-accurate", inputs=("output", "customer_brief"),
-    prompt_fn=_claims_prompt, image=SCORER_IMAGE,
+    prompt_fn=_claims_prompt, image=SCORER_IMAGE, **SCORER_SCALE,
 )  # fmt: skip
 
 SCORERS = [
@@ -587,6 +595,7 @@ def main(argv: list[str]) -> int:
         TAG,
         {
             "task_name": [s["id"] for s in scenarios],
+            "run_tag": [TAG] * len(scenarios),
             "ticket": [s["ticket"] for s in scenarios],
             "category": [s["category"] for s in scenarios],
             "difficulty": [s["difficulty"] for s in scenarios],
