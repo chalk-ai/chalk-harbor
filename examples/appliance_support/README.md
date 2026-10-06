@@ -154,6 +154,21 @@ The scorers are meant to pull against each other. An agent that grants every req
 customers and fails policy and cost. One that cites policy at people stays cheap and makes them
 irate.
 
+## Comparing in Braintrust
+
+`to_braintrust.py <tag>` reads one run back from the `harbor-traces` volume and logs it as a
+Braintrust experiment, one row per ticket. Each row has the ticket as input, the conversation,
+actions and survey answer as output, and the policy-correct resolution as expected. Its scores
+are the ones the Chalk evaluation recorded, and its metadata carries the failed checks, costs,
+judge rationales and Chalk ids. Each row's trace has Harbor's phases, one LLM span per agent
+turn and one tool span per tool call, built from the same files and timestamps as the Chalk
+trace.
+
+```bash
+BRAINTRUST_API_KEY=... ./to_braintrust.py larkspur-20261006-180007 --project larkspur-support
+./to_braintrust.py larkspur-20261006-180007 --jsonl out.jsonl   # no key: write the rows locally
+```
+
 ## How long a run takes
 
 A full 60-ticket run on ftqa takes about 6½ minutes end to end (380 s for the run itself), and
@@ -284,3 +299,4 @@ its ticket through `HELPDESK_TICKET` in `task.toml`.
 | `summarize.py` | a run's per-ticket scores as a markdown table |
 | `post_training/serve_policy.py` | the vLLM policy server, adapter volume and router provider connection |
 | `post_training/start_post_training.py` | starts (or checks) a post-training run of the evaluation |
+| `to_braintrust.py` | a run as a Braintrust experiment |
