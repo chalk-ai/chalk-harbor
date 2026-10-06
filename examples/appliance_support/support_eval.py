@@ -170,15 +170,29 @@ def larkspur_support_trial(task_name: str, run_tag: str) -> str:
     import uuid
 
     sys.path.insert(0, "/opt/harbor")
-    from chalk_harbor.evaluation import evaluation_context, evaluation_env
+    from chalk_harbor.evaluation import (
+        evaluation_context,
+        evaluation_env,
+        evaluation_run_metadata,
+        trial_tag,
+    )
     from chalk_harbor.tracing import stream_trial_spans
 
+    # A run's metadata overrides the deployed models, so one deployment serves every run of a
+    # post-training loop: `agent_model` is the policy's router name there.
+    context = evaluation_context()
+    metadata = evaluation_run_metadata(context.get("evaluation_run_id"))
+    agent_model = str(metadata.get("agent_model") or os.environ["LARKSPUR_AGENT_MODEL"])
+    customer_model = str(
+        metadata.get("customer_model") or os.environ["LARKSPUR_CUSTOMER_MODEL"]
+    )
+    tag = trial_tag(metadata, run_tag)
     job = f"{task_name}-{uuid.uuid4().hex[:6]}"
     jobs_dir = Path(tempfile.mkdtemp(prefix="harbor-jobs-"))
     command = [
         "harbor", "run", "-p", "/opt/harbor/tasks", "-i", task_name,
-        "-a", "support_agent:LarkspurSupportAgent", "-m", os.environ["LARKSPUR_AGENT_MODEL"],
-        "--ak", f"customer_model={os.environ['LARKSPUR_CUSTOMER_MODEL']}",
+        "-a", "support_agent:LarkspurSupportAgent", "-m", agent_model,
+        "--ak", f"customer_model={customer_model}",
         "-e", "chalk_harbor:ChalkSandboxEnvironment",
         "-o", str(jobs_dir), "--job-name", job, "--yes",
     ]  # fmt: skip
@@ -217,12 +231,12 @@ def larkspur_support_trial(task_name: str, run_tag: str) -> str:
     trial_dir = trials[0].parent if trials else None
     staged = Path(tempfile.mkdtemp(prefix="harbor-upload-"))
     _copy_regular_files(jobs_dir / job, staged)
-    record = {"task": task_name, "tag": run_tag, **evaluation_context(),
+    record = {"task": task_name, "tag": tag, **context,
               "harbor_exit_code": proc.returncode, "wall_seconds": wall}  # fmt: skip
     (staged / "chalk.json").write_text(json.dumps(record, indent=2))
     (staged / "harbor.stdout.txt").write_text(proc.stdout[-200_000:])
     (staged / "harbor.stderr.txt").write_text(proc.stderr[-200_000:])
-    volume_path = f"{run_tag}/{task_name}"
+    volume_path = f"{tag}/{task_name}"
     # The record is for later inspection, not for scoring, so it uploads after the row returns:
     # when a whole wave of rows finishes together their volume commits collide and back off,
     # which held each row for up to a minute. The replica outlives the call (min = max replicas).

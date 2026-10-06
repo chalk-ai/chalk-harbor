@@ -4,7 +4,9 @@ from chalk_harbor.evaluation import (
     EVALUATION_ID_ENV,
     EVALUATION_RUN_ID_ENV,
     SESSION_ID_ENV,
+    evaluation_run_metadata,
     sandbox_tags,
+    trial_tag,
 )
 
 EVALUATION_ID = "cmuuf4o4d005w0116nmsftjao"
@@ -63,3 +65,21 @@ def test_invalid_label_values_are_left_out(value: str) -> None:
 
 def test_outside_an_evaluation_there_are_no_tags() -> None:
     assert sandbox_tags({}) == {}
+
+
+def test_a_run_files_its_trials_under_its_own_trace_tag() -> None:
+    assert trial_tag({"trace_tag": "mine"}, "larkspur-x") == "mine"
+    assert trial_tag({"agent_model": "anthropic/x"}, "larkspur-x") == "larkspur-x"
+
+
+def test_post_training_rollouts_get_one_directory_per_sample() -> None:
+    # As a protobuf Struct delivers them: numbers are doubles.
+    metadata = {"post_training_id": "ptr1", "iteration": 2.0, "sample": 7.0}
+
+    assert (
+        trial_tag(metadata, "larkspur-x") == "larkspur-x/posttrain-ptr1/iter-2/sample-7"
+    )
+
+
+def test_no_run_means_no_metadata() -> None:
+    assert evaluation_run_metadata(None) == {}

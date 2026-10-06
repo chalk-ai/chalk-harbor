@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
+from typing import Any
 
 # Environment variables `harbor run` inherits from the evaluation task.
 EVALUATION_ID_ENV = "CHALK_HARBOR_EVALUATION_ID"
@@ -101,6 +102,59 @@ def sandbox_tags(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     }
 
 
+def evaluation_run_metadata(evaluation_run_id: str | None) -> dict[str, Any]:
+    """The metadata of an evaluation run, or ``{}`` without a run or when it can't be read.
+
+    A run's metadata is how one deployed task takes per-run settings, such as the model a
+    post-training rollout calls. Read failures return ``{}`` so the task falls back to its
+    deployed defaults instead of failing the row.
+    """
+    if not evaluation_run_id:
+        return {}
+    try:
+        import chalkcompute
+
+        run = chalkcompute.EvaluationRun.from_id(evaluation_run_id)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        print(
+            f"evaluation run {evaluation_run_id} metadata unavailable: {exc}",
+            flush=True,
+        )
+        return {}
+    return dict(run.metadata or {})
+
+
+def trial_tag(metadata: Mapping[str, Any], run_tag: str) -> str:
+    """The directory a run's trial records go under in a traces volume.
+
+    ``trace_tag`` in the run's metadata names it. Post-training rollouts name none, and go
+    under ``<run_tag>/posttrain-<id>/iter-<k>/sample-<s>`` from their ``post_training_id``,
+    ``iteration`` and ``sample``: a post-training's runs share one dataset, and with it one
+    ``run_tag``, so a shared directory would mix every sample's trials. Otherwise it is
+    ``run_tag``.
+    """
+    tag = metadata.get("trace_tag")
+    if tag:
+        return str(tag)
+    if metadata.get("post_training_id"):
+        return "/".join(
+            [
+                run_tag,
+                f"posttrain-{metadata['post_training_id']}",
+                f"iter-{_whole(metadata.get('iteration', 0))}",
+                f"sample-{_whole(metadata.get('sample', 0))}",
+            ]
+        )
+    return run_tag
+
+
+def _whole(value: Any) -> str:
+    # Run metadata travels as a protobuf Struct, where every number is a double.
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def _current_session_id() -> str | None:
     # The session chalkcompute is stamping spans with: the row's, set from row metadata or
     # the session header. Private in chalkcompute, so its absence is not an error.
@@ -117,5 +171,7 @@ __all__ = [
     "SESSION_ID_ENV",
     "evaluation_context",
     "evaluation_env",
+    "evaluation_run_metadata",
     "sandbox_tags",
+    "trial_tag",
 ]
