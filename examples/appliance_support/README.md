@@ -1,14 +1,14 @@
 # Larkspur: customer-support agents as a Harbor benchmark on Chalk
 
-30 support tickets for **Larkspur Home Delivery & Installation**, a fictional company that sells,
+60 support tickets for **Larkspur Home Delivery & Installation**, a fictional company that sells,
 delivers and installs home appliances. Each ticket is a Harbor task. An agent works it with real
 tools, talks to a simulated customer, and is scored on whether it followed policy, what its
-actions cost, and how the customer felt. `support_eval.py` runs all 30 as a Chalk evaluation.
+actions cost, and how the customer felt. `support_eval.py` runs all 60 as a Chalk evaluation.
 
 ```bash
 ./build_tasks.py                      # scenarios.py -> tasks/<id>/
 uv run --with pytest pytest test_scenarios.py   # every rubric gives the reference resolution 1.0
-./support_eval.py                     # all 30 tickets as a Chalk evaluation (or --only <id> ...)
+./support_eval.py                     # all 60 tickets as a Chalk evaluation (or --only <id> ...)
 ./support_eval.py --rescore <run-id>  # score an earlier run's outputs with the current scorers
 ./summarize.py runs/<tag>.json        # per-ticket scores as a markdown table
 ```
@@ -26,7 +26,7 @@ proof of delivery).
 | Tool | Runs | What it does |
 | --- | --- | --- |
 | `run_python`, `run_bash` | sandbox, as user `agent` | Python 3.13 / bash, no network, 20 s limit |
-| `search_knowledge_base` | sandbox | BM25 search over 22 policy articles (`helpdesk/kb/`) |
+| `search_knowledge_base` | sandbox | BM25 search over 25 policy articles (`helpdesk/kb/`) |
 | `issue_refund` | sandbox, `helpdesk` | refund or goodwill credit to the original payment method |
 | `approve_exchange_exception` | sandbox, `helpdesk` | out-of-window exchange exception for one item |
 | `escalate_to_human` | sandbox, `helpdesk` | hand off to `approvals`, `claims`, `risk`, `safety` or `supervisor` |
@@ -55,7 +55,9 @@ user agent inside the task container, and that would need network in the contain
 ## The tickets
 
 All take place on Tuesday 2026-10-06. Each one tests a specific policy judgment. Several test
-restraint: the right answer is a clear "no", or a pointer to self-service.
+restraint: the right answer is a clear "no", or a pointer to self-service. The second 30
+(`scenarios_batch2.py`) sit on policy boundaries (day 14, day 75 vs. 76, the 30-minute grace
+period, the 48-hour damage window) or test over-caution, privacy, billing errors and recalls.
 
 | Task | Category | Difficulty | Ticket |
 | --- | --- | --- | --- |
@@ -89,6 +91,36 @@ restraint: the right answer is a clear "no", or a pointer to self-service.
 | `in-window-size-exchange` | exchange | easy | In-window exchange for a larger model (self-serve) |
 | `return-installed-not-defective` | return | medium | Return of an installed dishwasher that is within spec |
 | `incomplete-gas-dryer-install` | installation | medium | Gas dryer delivered but not installed (crew lacked a connector) |
+| `missed-white-glove-gold-first` | missed delivery | easy | Gold customer, first missed white-glove window |
+| `late-within-grace` | missed delivery | medium | Crew arrived 25 minutes after the window without calling |
+| `late-with-advance-call` | missed delivery | medium | Dispatcher called three hours ahead to move the window |
+| `second-miss-fee-already-refunded` | missed delivery | medium | Second miss after the fee was refunded for the first |
+| `damage-visible-gold-within-authority` | delivery damage | medium | Visible front dent, Gold customer, within $500 authority |
+| `damage-reported-after-48h` | delivery damage | medium | Cosmetic scratch noticed Sunday, reported Tuesday (about 71 hours) |
+| `damage-noted-on-pod-late-report` | delivery damage | hard | Damage recorded on the POD, reported 10 days later |
+| `defect-within-30-days` | exchange | easy | Fridge not cooling 12 days after delivery |
+| `oow-exchange-day-75` | exchange exception | hard | Platinum customer, dishwasher defect at exactly 75 days |
+| `oow-exchange-day-76` | exchange exception | hard | Gold customer, washer defect at 76 days, no ProtectPlan |
+| `oow-exception-cosmetic-gold` | exchange exception | medium | Gold customer wants an exchange for a scuff found at 46 days |
+| `install-warranty-expired` | installation | medium | Leak at a Larkspur connection 14 months after install |
+| `install-warranty-customer-modified` | installation | hard | Leak at a connection the customer's plumber redid |
+| `active-flooding-washer` | safety | hard | Washer hose came off, water spreading now |
+| `gas-smell-not-larkspur` | safety | hard | Gas smell near a furnace Larkspur never touched |
+| `sparking-otr-microwave` | safety | hard | Sparks from an over-the-range microwave Larkspur installed |
+| `protectplan-expired` | repair | medium | ProtectPlan expired two months ago; washer won't spin |
+| `protectplan-cosmetic` | repair | medium | ProtectPlan holder wants a dented door panel replaced |
+| `price-drop-day-14` | price adjustment | medium | Price drop on day 14 exactly |
+| `price-drop-open-box` | price adjustment | easy | Open-box purchase now cheaper |
+| `price-drop-two-items` | price adjustment | medium | Two items on one order dropped in price |
+| `haul-away-not-purchased` | haul away | medium | Crew didn't take the old fridge, but haul-away wasn't purchased |
+| `return-unopened-in-window` | return | medium | Return of an unopened range at 20 days |
+| `return-installed-day-18` | return | medium | Return of an installed, working dryer at 18 days |
+| `single-fraud-signal-legit-miss` | fraud | hard | Legitimate missed delivery; one old chargeback on file |
+| `fraud-damage-claim-contradicts-pod` | fraud | hard | Damage claim contradicted by POD photos; frequent refunds |
+| `privacy-family-member` | privacy | hard | Son asks about his mother's delivery and wants it moved |
+| `duplicate-delivery-charge` | billing | medium | White-glove fee charged twice |
+| `manager-demand-simple-question` | escalation | medium | Customer demands a manager over a delivery-time question |
+| `recall-question` | recall | medium | Customer asks about a microwave recall |
 
 ## Scoring
 
@@ -122,6 +154,30 @@ The scorers are meant to pull against each other. An agent that grants every req
 customers and fails policy and cost. One that cites policy at people stays cheap and makes them
 irate.
 
+## How long a run takes
+
+A full 60-ticket run on ftqa takes about 6½ minutes end to end (380 s for the run itself), and
+`--rescore` about 1½ minutes. Each trial takes 30–60 s. What sets the pace:
+
+- **Waves.** The evaluation sends rows to the trial function in ramping waves of 8, 16 and 32
+  rows, and each wave waits for its slowest trial. The ramp is the engine's slow-start for
+  remote calls, not something this example controls.
+- **One replica per wave.** Each wave arrives at a single replica as one batch, so that replica
+  starts a whole wave of `harbor run` processes at once. Their startup is CPU-bound, about
+  5 CPU-seconds each, so the trial function uses 4 replicas with 16 CPUs each rather than many
+  small ones.
+- **`concurrency` is global.** It caps in-flight calls across all replicas, so it is set to 64.
+- **No per-run redeploy.** The run's tag arrives as a dataset column, not as function config,
+  so consecutive runs reuse the deployed functions.
+- **Scorers take 32 rows at once.** At the default of one row at a time, scoring alone took
+  about 100 s per 30 rows.
+- **`harbor run` has no telemetry.** OTel and Harbor's usage telemetry are off in the
+  subprocess, where a failing trace export added about 80 s per trial at exit. The trial's spans
+  come from `stream_trial_spans` in the function instead. Each row records
+  `process_startup_seconds` and `process_exit_seconds` so a regression shows up in the output.
+- **Uploads run in the background.** The trial record goes to the volume after the row has
+  returned.
+
 ## Running pieces locally
 
 `harbor run` works from a laptop against Chalk sandboxes. Point chalkcompute and the agent's
@@ -137,7 +193,7 @@ harbor run -p tasks -i gas-smell-after-install -a support_agent:LarkspurSupportA
     -e chalk_harbor:ChalkSandboxEnvironment --yes
 ```
 
-All 30 tasks share one `environment/` (the helpdesk backend, the knowledge base and every sealed
+All 60 tasks share one `environment/` (the helpdesk backend, the knowledge base and every sealed
 persona), so they share one sandbox image, which is built once and then cached. Each task picks
 its ticket through `HELPDESK_TICKET` in `task.toml`.
 
@@ -145,7 +201,8 @@ its ticket through `HELPDESK_TICKET` in `task.toml`.
 
 | Path | What |
 | --- | --- |
-| `scenarios.py` | the 30 tickets: records, persona, rubric, reference resolution, judge brief |
+| `scenarios.py`, `scenarios_batch2.py` | the 60 tickets: records, persona, rubric, reference resolution, judge brief |
+| `scenario_kit.py` | rubric checks, reference actions and record helpers the tickets are built from |
 | `build_tasks.py` | renders `tasks/<id>/` (instruction, task.toml, shared environment, rubric, oracle) |
 | `helpdesk/` | the in-sandbox backend (`lib/helpdesk`), CLI (`bin/helpdesk`) and knowledge base (`kb/`) |
 | `support_agent.py` | the Harbor agent: tool loop, simulated customer, ATIF trajectory |

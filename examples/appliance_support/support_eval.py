@@ -41,6 +41,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -104,21 +105,21 @@ def _copy_regular_files(source: Path, destination: Path) -> None:
             shutil.copy2(path, target)
 
 
-def _upload_with_retry(staged: Path, volume_path: str) -> str | None:
+def _upload_with_retry(staged: Path, volume_path: str) -> None:
     # Rows that finish together all commit to the volume's main ref at once; the volume service
-    # gives up after a few rebases, so spread the retries out.
+    # gives up after a few rebases, so spread the retries out. Runs after the row has returned,
+    # so a final failure can only be logged.
     import random
 
-    error = None
     for attempt in range(8):
         try:
             with chalkcompute.Volume(VOLUME) as volume:
                 volume.put_dir(staged, volume_path)
-            return None
-        except Exception as exc:  # noqa: BLE001 - reported in the row, not fatal to scoring
+            return
+        except Exception as exc:  # noqa: BLE001 - logged; the trial record is not needed to score
             error = f"{type(exc).__name__}: {exc}"[:1000]
             time.sleep(random.uniform(1, 4) * (attempt + 1))
-    return error
+    print(f"upload of {volume_path} failed: {error}", flush=True)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -150,13 +151,16 @@ def _router_env() -> dict[str, str]:
         "LARKSPUR_AGENT_MODEL": AGENT_MODEL,
         "LARKSPUR_CUSTOMER_MODEL": CUSTOMER_MODEL,
     },
-    # 8 replicas x 8 trials covers all 60 tickets at once, and min = max keeps them warm. Each
-    # trial runs its own `harbor run` process, whose startup is CPU-bound, so 8 per 4-CPU replica.
-    concurrency=8,
-    min_replicas=8,
-    max_replicas=8,
-    cpu="4",
-    memory="16Gi",
+    # `concurrency` caps the function's in-flight calls across ALL replicas, not per replica; at 8,
+    # 60 tickets ran in 8 sequential waves. The evaluation sends rows in ramping waves (8, 16, 32)
+    # and each wave arrives at ONE replica as a single batch, so a replica must start a whole
+    # wave of `harbor run` processes at once; their Python startup is CPU-bound (~5 CPU-s each).
+    # Hence few, large replicas: on 4 CPUs a 32-row wave spent 28 s just starting up.
+    concurrency=64,
+    min_replicas=4,
+    max_replicas=4,
+    cpu="16",
+    memory="32Gi",
     call_timeout=1500,
 )
 def larkspur_support_trial(task_name: str, run_tag: str) -> str:
@@ -179,19 +183,29 @@ def larkspur_support_trial(task_name: str, run_tag: str) -> str:
         "-o", str(jobs_dir), "--job-name", job, "--yes",
     ]  # fmt: skip
     instruction = Path("/opt/harbor/tasks", task_name, "instruction.md")
+    prepare_started = time.time()
+    harbor_env = {
+        **os.environ,
+        **evaluation_env(),
+        **_router_env(),
+        "PYTHONPATH": "/opt/harbor",
+        # This process streams the trial's spans itself. Left on, OTel in `harbor run` retried a
+        # failing export at exit for ~80 s per trial.
+        "OTEL_SDK_DISABLED": "true",
+        "OTEL_TRACES_EXPORTER": "none",
+        # Harbor's own usage telemetry (PostHog) is a network call per run.
+        "HARBOR_TELEMETRY": "0",
+    }
+    prepare_seconds = round(time.time() - prepare_started, 1)
     started = time.time()
     with stream_trial_spans(
         jobs_dir / job,
         instruction=instruction.read_text() if instruction.exists() else None,
     ):
+        spans_ready = time.time()
         proc = subprocess.run(
             command,
-            env={
-                **os.environ,
-                **evaluation_env(),
-                **_router_env(),
-                "PYTHONPATH": "/opt/harbor",
-            },
+            env=harbor_env,
             capture_output=True,
             text=True,
             timeout=1400,
@@ -209,12 +223,32 @@ def larkspur_support_trial(task_name: str, run_tag: str) -> str:
     (staged / "harbor.stdout.txt").write_text(proc.stdout[-200_000:])
     (staged / "harbor.stderr.txt").write_text(proc.stderr[-200_000:])
     volume_path = f"{run_tag}/{task_name}"
-    upload_error = _upload_with_retry(staged, volume_path)
+    # The record is for later inspection, not for scoring, so it uploads after the row returns:
+    # when a whole wave of rows finishes together their volume commits collide and back off,
+    # which held each row for up to a minute. The replica outlives the call (min = max replicas).
+    import threading
+
+    threading.Thread(
+        target=_upload_with_retry,
+        args=(staged, volume_path),
+        name=f"upload-{task_name}",
+    ).start()
 
     if trial_dir is None:
-        return json.dumps({**record, "volume_path": volume_path, "upload_error": upload_error,
+        return json.dumps({**record, "volume_path": volume_path,
                            "error": (proc.stderr or proc.stdout)[-2000:]})  # fmt: skip
     result = _read_json(trial_dir / "result.json")
+    job_result = _read_json(jobs_dir / job / "result.json")
+    try:
+        # How long `harbor run` spent outside its job: process startup, and exit after the job.
+        job_start = datetime.fromisoformat(job_result["started_at"]).timestamp()
+        job_end = datetime.fromisoformat(job_result["finished_at"]).timestamp()
+        record["process_startup_seconds"] = round(job_start - spans_ready, 1)
+        record["span_streamer_start_seconds"] = round(spans_ready - started, 1)
+        record["prepare_env_seconds"] = prepare_seconds
+        record["process_exit_seconds"] = round(started + wall - job_end, 1)
+    except (KeyError, TypeError, ValueError):
+        pass
     grade = _read_json(trial_dir / "verifier" / "grade.json")
     conversation = _read_json(trial_dir / "agent" / "conversation.json")
     ledger_path = trial_dir / "verifier" / "ledger.jsonl"
@@ -245,7 +279,6 @@ def larkspur_support_trial(task_name: str, run_tag: str) -> str:
             "ticket": grade.get("ticket") or conversation.get("ticket"),
             "trial": result.get("trial_name"),
             "volume_path": f"{volume_path}/{trial_dir.name}",
-            "upload_error": upload_error,
             "agent_model": conversation.get("agent_model"),
             "customer_model": conversation.get("customer_model"),
             "reward": grade.get("reward"),
