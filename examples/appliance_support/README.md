@@ -193,6 +193,79 @@ A full 60-ticket run on ftqa takes about 6½ minutes end to end (380 s for the r
 - **Uploads run in the background.** The trial record goes to the volume after the row has
   returned.
 
+## Post-training a small model on the evaluation
+
+The evaluation's scorers are a reward. Post-training uses them to train
+`Qwen/Qwen3-4B-Instruct-2507` to replace the task's model: each iteration runs the evaluation
+with the current policy, then takes one on-policy GRPO step of a LoRA adapter on the scored
+trajectories. A Chalk workflow (`EvaluationService.StartEvaluationPostTraining`) drives the loop.
+This directory supplies the policy server and the starting call. The trainer is
+`chalk_harbor.post_training`, run by Chalk model training from the image in
+`docker/trainer.Dockerfile`.
+
+```bash
+cd post_training
+./serve_policy.py                      # once per environment: vLLM + adapter volume + router prefix
+../../../scripts/build_trainer_image.py   # prints the trainer image URI (installs a pushed commit)
+./start_post_training.py --evaluation-id <id> --trainer-image <uri> --policy-server-url <url>
+./start_post_training.py --status <post-training id>
+```
+
+**The loop.** For iteration k = 0..9, with id `<id>`:
+
+1. **Rollout.** The workflow starts 8 runs (`samples_per_row`) of the evaluation, each with
+   metadata `{agent_model, post_training_id, iteration, sample}`. The trial function reads
+   `agent_model` from its run's metadata instead of `LARKSPUR_AGENT_MODEL`. At k = 0 that is
+   `posttrain/Qwen/Qwen3-4B-Instruct-2507`, and after that it is `posttrain/adapter-<id>-<k>`.
+   The AI router sends the `posttrain/` prefix to the vLLM server, and the simulated customer
+   (`openai/...`) and the judges to their providers, all with the function's Chalk identity.
+   Each run's trials land in `harbor-traces` under
+   `<run_tag>/posttrain-<id>/iter-<k>/sample-<s>/`, so the 8 runs over one dataset stay apart.
+2. **Training.** A training run (`python -m chalkcompute.training.entrypoint` calling
+   `chalk_harbor.post_training.train_policy`) reads the 8 result datasets. A row's reward is
+   `Σ weight × score`. The 8 samples of a ticket form a group, and each sample's advantage is
+   its reward minus the group mean. The trainer rebuilds each sample's chat from its ATIF
+   trajectory (`volume_path` in the output), tokenizes it with the model's chat template and
+   tools, and trains only on the tokens the model generated: its messages and tool calls. It
+   then takes one AdamW step, saves `adapter-<id>-<k+1>` to the adapter volume, and loads it
+   into vLLM with `/v1/load_lora_adapter`.
+
+A final rollout with the last adapter reports where training ended.
+
+**Reward weighting** (`start_post_training.py`, override with `--reward-weights`):
+
+| Scorer | Weight | Why |
+| --- | --- | --- |
+| `larkspur-policy-compliance` | 1.0 | the outcome the business needs |
+| `larkspur-cost-of-service` | 0.5 | keeps "compliant" from meaning "refund everything" |
+| `larkspur-agent-claims-accurate` | 0.2 | no invented policy or promises |
+| `larkspur-customer-satisfied` | 0.15 | judged CSAT; noisier, so lighter |
+| `larkspur-csat-survey` | 0.1 | the simulated customer's own answer; noisiest |
+| `larkspur-customer-got-irate` | −0.3 | 1 = irate, so a penalty |
+
+`cost-of-service-usd` is left out because the dollar amount is unbounded and would swamp the
+other terms; `larkspur-cost-of-service` is the same signal mapped into [0, 1]. Only differences
+within a ticket's group matter, so a ticket that every sample solves, or every sample fails,
+teaches nothing and is skipped.
+
+**Costs, per iteration** (60 tickets × 8 samples = 480 trials):
+
+- **Rollout:** 480 trials at the trial function's 64-call concurrency, roughly 10–15 minutes.
+  Each trial costs about 8 simulated-customer calls (`gpt-5.4-mini`) plus the survey. Each row
+  costs three `gpt-5.4` judge calls, and the claims judge's prompt carries the whole knowledge
+  base. The judges are most of the provider spend: about 1,440 judge calls per iteration and
+  about 16,000 over a 10-iteration run plus the final rollout.
+- **Policy server:** one L40S running vLLM for the whole run. After the 8 GB of weights, about
+  30 GB is left for KV cache, which holds roughly 200k tokens (about 150 KB per token). The 64
+  concurrent conversations share that space, and vLLM queues the ones that don't fit. A larger GPU
+  shortens the rollout. Keep one replica: `/v1/load_lora_adapter` loads the adapter only into
+  the replica that answers it.
+- **Training:** one L40S for roughly 15–30 minutes. That covers downloading the base model
+  (~8 GB) and a forward and backward pass over the informative samples, with gradient
+  checkpointing, at up to 32k tokens each.
+
+A 10-iteration run takes on the order of 5–8 hours of wall time.
+
 ## Running pieces locally
 
 `harbor run` works from a laptop against Chalk sandboxes. Point chalkcompute and the agent's
@@ -224,4 +297,6 @@ its ticket through `HELPDESK_TICKET` in `task.toml`.
 | `support_eval.py` | the Chalk evaluation: trial function, scorers, run |
 | `test_scenarios.py` | rubric self-checks against the reference resolutions |
 | `summarize.py` | a run's per-ticket scores as a markdown table |
+| `post_training/serve_policy.py` | the vLLM policy server, adapter volume and router provider connection |
+| `post_training/start_post_training.py` | starts (or checks) a post-training run of the evaluation |
 | `to_braintrust.py` | a run as a Braintrust experiment |

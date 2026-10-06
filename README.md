@@ -80,6 +80,40 @@ run's trials can be found by run id while the run is still going. Per-turn spans
 that writes an ATIF trajectory (`agent/trajectory.json`), such as codex, claude-code or
 terminus. The `oracle` agent writes none, so its trials show only the phases.
 
+## Post-training on an evaluation
+
+`chalk_harbor.post_training` trains a model on a Harbor-based Chalk evaluation, with the
+evaluation's scorers as the reward: one on-policy GRPO step of a LoRA adapter (PEFT +
+transformers) per iteration. A post-training workflow runs it as a Chalk training run with
+`CHALK_TRAINING_MODULE=chalk_harbor.post_training.train_policy`. The training run's `config`
+holds:
+
+| Key | Meaning |
+| --- | --- |
+| `post_training_id`, `iteration` | which post-training and which iteration k |
+| `base_model`, `lora_rank`, `learning_rate` | the Hugging Face base model and the LoRA step |
+| `adapter_in`, `adapter_out` | the adapter to start from (`""` at k = 0) and the one to write |
+| `adapter_dir` | where the adapter volume is mounted in the training run |
+| `policy_server_url`, `policy_adapter_dir` | the vLLM server, and where it mounts the same volume |
+| `result_dataset_revision_ids` | one result revision per rollout run of iteration k |
+| `group_columns` | dataset columns whose values identify a row; equal values form one group |
+| `output_column` | the task output column, whose JSON points at the trial (`volume_path`) |
+| `reward_weights` | scorer id to weight (negative for a scorer to minimize) |
+| `scorer_columns` | scorer id to `{column, field}`; defaults to `<scorer>_value` / `score` |
+
+Optional trainer settings (`max_seq_len`, `logprob_chunk_size`, `trajectory_volume`, and more)
+are listed in `chalk_harbor/post_training/config.py`. The trainer reads each sample's ATIF
+trajectory from the `harbor-traces` volume at `<volume_path>/agent/trajectory.json`. A
+`trajectory` object inline in the output also works.
+
+**The trainer image.** `docker/trainer.Dockerfile` installs CUDA torch, transformers, peft,
+chalkcompute, chalkpy and this package. Build it with `docker build -f docker/trainer.Dockerfile .`
+and push it to a registry the cluster pulls from. Alternatively, run
+`scripts/build_trainer_image.py [--ref <commit>]`: it builds the same image with Chalk's image
+builder and prints the URI to pass as `trainer_image`.
+
+Tests run on CPU with a tiny random Qwen3: `uv run --extra post-training pytest`.
+
 ## Environment kwargs
 
 Pass with `--ek key=value`:
