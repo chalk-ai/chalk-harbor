@@ -113,7 +113,8 @@ def provider_connection_request(
         "name": args.connection_name,
         "providerKind": "vllm",
         "baseUrl": f"{server_url.rstrip('/')}/v1",
-        "prefix": args.prefix,
+        # The router stores a prefix as one segment with its trailing slash.
+        "prefix": f"{args.prefix.rstrip('/')}/",
         "exposure": "EXPOSURE_POLICY_DYNAMIC",
         "routingEnabled": True,
     }
