@@ -81,6 +81,9 @@ def scaling_group(args: argparse.Namespace) -> Any:
     env: dict[str, Any] = {
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
         "HF_HOME": "/tmp/hf",
+        # GKE mounts the driver libraries under /usr/local/nvidia; the vLLM image's own
+        # LD_LIBRARY_PATH omits them, so vLLM would find no GPU there.
+        "LD_LIBRARY_PATH": "/usr/local/nvidia/lib64:/usr/local/cuda/lib64",
     }
     if args.api_key_env:
         env["VLLM_API_KEY"] = Secret.from_local_env(args.api_key_env)
