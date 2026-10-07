@@ -75,7 +75,8 @@ DATA_DICTIONARY = """\
 
 **Python sandbox (free).** Python 3.13, standard library, no network.
 
-**Deep identity verification ($5 per call).** Document and SSN/name/DOB match, liveness,
+**Deep identity verification ($5 per call).** A fresh check of the person requesting this
+payout: document and SSN/name/DOB match, liveness (a live selfie matched to the ID document),
 synthetic-identity score, phone tenure, recent SIM swap, address history.
 
 **Social network search ($2 per call).** Identities linked to the account across the fraud

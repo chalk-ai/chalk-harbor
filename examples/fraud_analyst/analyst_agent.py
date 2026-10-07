@@ -82,7 +82,7 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "deep_verification",
-        "description": "Deep identity verification for an account: document and SSN/name/DOB match, liveness, synthetic-identity score, phone tenure, recent SIM swap, address history. Costs $5 per call.",
+        "description": "Deep identity verification, a fresh check of the person requesting the payout: document and SSN/name/DOB match, liveness (a live selfie matched to the ID document), synthetic-identity score, phone tenure, recent SIM swap, address history. Costs $5 per call.",
         "parameters": {"type": "object", "properties": {"account_id": {"type": "string"}}, "required": ["account_id"]}}},
     {"type": "function", "function": {
         "name": "social_network_search",

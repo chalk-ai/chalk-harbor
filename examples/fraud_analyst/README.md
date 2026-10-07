@@ -46,10 +46,15 @@ paid result against the rest.
 | `ato_quiet` | fraud | long tenure, US, no VPN, risk 0.12-0.3 | a second device appears in the last two days *while the owner's device is still active*, with a password reset and a new bank account; deep verification shows a SIM swap **and failed liveness** |
 | `bust_out` | fraud | verified real identity (deep verification clean), one device, risk 0.15-0.35 | free: a long-quiet account takes 5-8 deposits from different new cards in ten days and cashes nearly all of it out on its first payout; network search reports the cards |
 | `legit_account_recovery` | legit | reads exactly like a takeover: new device, password reset, new bank account, **SIM swap**, risk 0.6-0.8 | the old device went silent before the new one appeared (a replacement, not a second user), liveness passes, no consortium links |
-| `legit_resold_device` | legit | the login device was used by an account closed for fraud; shared-device count 1, risk 0.55-0.78 | the fraudster's last use of the device was a year or more before this account was opened |
+| `legit_resold_device` | legit | the login device was used by an account closed for fraud; shared-device count 1, risk 0.55-0.78 | the fraudster's last use of the device was 7-21 months before this account was opened |
 | `legit_vpn_privacy` | legit | every login over a VPN exiting in a high-risk country, risk 0.65-0.88 | the same device and exit country for years, no reset, and the payout goes to the bank account every previous payout went to |
 
 The hard tier draws from its own random stream, so it leaves the first 40 cases byte-for-byte unchanged.
+
+With `anthropic/claude-haiku-4-5` as the analyst, the standard demo scores 12/12 and the hard tier
+8/12 (quality 0.61, $60 of paid checks). The misses are the intended traps. The agent denies the
+phone-loss recoveries after quoting the passed liveness check, denies a resold device after noting
+the gap since the fraudster last used it, and approves a bust-out whose deposits it calls savings.
 
 ## What the agent gets
 

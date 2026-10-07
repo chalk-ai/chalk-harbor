@@ -107,6 +107,39 @@ def _upload_with_retry(staged: Path, volume_path: str) -> None:
     print(f"upload of {volume_path} failed: {error}", flush=True)
 
 
+def _task_digest(task_dir: Path) -> str:
+    """A digest of one task's files, to tell a current deployment from a stale one."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for path in sorted(p for p in task_dir.rglob("*") if p.is_file()):
+        digest.update(
+            str(path.relative_to(task_dir)).encode() + b"\0" + path.read_bytes() + b"\0"
+        )
+    return digest.hexdigest()[:16]
+
+
+def _wait_for_current_revision(name: str, timeout: float) -> None:
+    """Wait until the function's newest revision is serving.
+
+    ``wait_ready`` returns once any replica is ready, and during a rollout those are the previous
+    revision's, which would run the previous tasks.
+    """
+    group = chalkcompute.ScalingGroup.from_name(name)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = group.refresh().current_revision_id
+        status = next(
+            (r.status for r in group.revisions(limit=5) if r.id == current), None
+        )
+        if status == "Available":
+            return
+        time.sleep(5)
+    raise TimeoutError(
+        f"{name}: revision {current} still {status} after {timeout:.0f}s"
+    )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text())
@@ -141,13 +174,21 @@ def _router_env() -> dict[str, str]:
     memory="32Gi",
     call_timeout=1500,
 )
-def kestrel_fraud_trial(task_name: str, run_tag: str) -> str:
+def kestrel_fraud_trial(task_name: str, run_tag: str, task_digest: str) -> str:
     import os
     import subprocess
     import tempfile
     import threading
     import uuid
 
+    # A redeploy can report ready while the previous revision still takes calls; that revision has
+    # the previous tasks baked in and would run them silently.
+    deployed = _task_digest(Path("/opt/harbor/tasks", task_name))
+    if deployed != task_digest:
+        raise RuntimeError(
+            f"{task_name}: the deployed task ({deployed}) differs from the local one ({task_digest}); "
+            + "the function is still serving an earlier revision, so rerun once the new one is live"
+        )
     sys.path.insert(0, "/opt/harbor")
     from chalk_harbor.evaluation import evaluation_context, evaluation_env
     from chalk_harbor.tracing import stream_trial_spans
@@ -424,11 +465,13 @@ def main(argv: list[str]) -> int:
     finally:
         client.close()
     kestrel_fraud_trial.wait_ready(timeout=1200)
+    _wait_for_current_revision("kestrel-fraud-trial", timeout=1200)
     dataset = chalkcompute.DatasetClient().upload(
         TAG,
         {
             "task_name": [c["case_id"].lower() for c in cases],
             "run_tag": [TAG] * len(cases),
+            "task_digest": [_task_digest(TASKS / c["case_id"].lower()) for c in cases],
             "archetype": [c["archetype"] for c in cases],
             "label": [c["label"] for c in cases],
         },
