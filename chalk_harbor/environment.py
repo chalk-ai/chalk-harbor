@@ -69,6 +69,9 @@ from chalk_harbor.evaluation import sandbox_tags
 # Largest compressed context one COPY may embed. Build steps travel inside the image spec,
 # so an unbounded payload would turn a stray COPY of a dataset into an opaque RPC failure.
 _EMBED_BUDGET_BYTES = 4 * 1024 * 1024
+# The whole translated Dockerfile reaches the image service's build as one shell argument, which
+# the kernel caps at 128 KiB; keep headroom for the base image line and the wrapper script.
+_DOCKERFILE_BUDGET_BYTES = 120 * 1024
 # Runs a Harbor command string under bash when the image has it: agent install scripts
 # use bash syntax, but minimal images (alpine, distroless-ish) only ship sh.
 # The image service discards everything written under /workspace during a build (the
@@ -393,6 +396,15 @@ def _image_from_dockerfile(dockerfile: Path, image_map: dict[str, str]) -> Image
         else:
             commands.append(instruction["content"].strip())
     assert image is not None
+    size = sum(len(command) + 1 for command in commands)
+    if size > _DOCKERFILE_BUDGET_BYTES:
+        raise ValueError(
+            f"{dockerfile}: translates to {size} bytes of build steps, over the "
+            f"{_DOCKERFILE_BUDGET_BYTES}-byte limit for one image build (the image service passes "
+            "the whole Dockerfile as one shell argument, which the kernel caps at 128 KiB). "
+            "Embedded COPY sources count in full: generate large data in a RUN step instead, "
+            "or mount it with --ek volumes=..."
+        )
     return image.dockerfile_commands(commands) if commands else image
 
 

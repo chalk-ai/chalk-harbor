@@ -1,0 +1,2 @@
+#!/bin/sh
+PYTHONPATH="${FRAUDLAB_HOME:-/opt/fraudlab}/lib" exec python3 -m fraudlab.cli "$@"
