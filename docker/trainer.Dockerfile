@@ -21,6 +21,9 @@ COPY chalk_harbor ./chalk_harbor
 RUN pip install --no-cache-dir ".[post-training]" chalkpy polars
 
 # Hugging Face downloads (the base model, ~8 GB for a 4B model) go to the container's disk.
+# GKE mounts the node's driver libraries (libcuda) under /usr/local/nvidia but adds them to no
+# loader path; without LD_LIBRARY_PATH torch finds no GPU there.
 ENV HF_HOME=/tmp/hf \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
     PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=false

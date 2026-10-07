@@ -81,6 +81,9 @@ def scaling_group(args: argparse.Namespace) -> Any:
     env: dict[str, Any] = {
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
         "HF_HOME": "/tmp/hf",
+        # GKE mounts the driver libraries under /usr/local/nvidia; the vLLM image's own
+        # LD_LIBRARY_PATH omits them, so vLLM would find no GPU there.
+        "LD_LIBRARY_PATH": "/usr/local/nvidia/lib64:/usr/local/cuda/lib64",
     }
     if args.api_key_env:
         env["VLLM_API_KEY"] = Secret.from_local_env(args.api_key_env)
@@ -110,7 +113,8 @@ def provider_connection_request(
         "name": args.connection_name,
         "providerKind": "vllm",
         "baseUrl": f"{server_url.rstrip('/')}/v1",
-        "prefix": args.prefix,
+        # The router stores a prefix as one segment with its trailing slash.
+        "prefix": f"{args.prefix.rstrip('/')}/",
         "exposure": "EXPOSURE_POLICY_DYNAMIC",
         "routingEnabled": True,
     }
