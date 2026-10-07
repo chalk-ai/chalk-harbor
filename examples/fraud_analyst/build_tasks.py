@@ -8,7 +8,7 @@
 
     ./build_tasks.py
 
-One Harbor task per case in the review queue (40). Every task shares one ``environment/``: the
+One Harbor task per case in the review queue (52: 40 standard, then a hard tier of 12). Every task shares one ``environment/``: the
 ``fraudlab`` backend and the seeded population generator, which writes the warehouse (read-only
 SQLite), the Chalk feature values and the paid tools' results (sealed root-only) at image build
 time. All tasks therefore share one cached sandbox image; the task picks its case through
@@ -64,7 +64,7 @@ DATA_DICTIONARY = """\
 | --- | --- |
 | `accounts` | account_id, created_at, full_name, email, phone, city, status (`active`, `closed_fraud`, `closed_voluntary`, `pending_review`) |
 | `logins` | account_id, ts, device_id, ip_country, vpn (0/1) |
-| `transactions` | txn_id, account_id, ts, type (`purchase`, `deposit`, `payout`), amount, destination, status (`settled`, `chargeback`, `pending`) |
+| `transactions` | txn_id, account_id, ts, type (`purchase`, `deposit`, `payout`), amount, destination (a payout's bank account; a deposit's funding card, when known), status (`settled`, `chargeback`, `pending`) |
 | `review_queue` | case_id, account_id, opened_at, trigger, amount_usd |
 
 **Chalk feature query (free).** Online features for any account: `account.age_days`,
@@ -115,16 +115,22 @@ def reference_steps(case: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     account = case["account_id"]
     steps: list[tuple[str, dict[str, Any]]] = [("chalk_query", {"account_id": account})]
     archetype = case["archetype"]
-    if archetype in ("ring_member", "legit_household"):
+    if archetype in ("ring_member", "legit_household", "legit_resold_device"):
         steps.append(
             (
                 "run_sql",
                 {
-                    "query": f"SELECT l2.account_id, a.status FROM logins l1 JOIN logins l2 ON l1.device_id = l2.device_id AND l2.account_id != l1.account_id JOIN accounts a ON a.account_id = l2.account_id WHERE l1.account_id = '{account}' GROUP BY 1, 2"
+                    "query": f"SELECT l2.account_id, a.status, MIN(l2.ts), MAX(l2.ts) FROM logins l1 JOIN logins l2 ON l1.device_id = l2.device_id AND l2.account_id != l1.account_id JOIN accounts a ON a.account_id = l2.account_id WHERE l1.account_id = '{account}' GROUP BY 1, 2"
                 },
             )
         )
-    if archetype in ("account_takeover", "legit_traveler"):
+    if archetype in (
+        "account_takeover",
+        "legit_traveler",
+        "ato_quiet",
+        "legit_account_recovery",
+        "legit_vpn_privacy",
+    ):
         steps.append(
             (
                 "run_sql",
@@ -133,14 +139,41 @@ def reference_steps(case: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
                 },
             )
         )
+    if archetype == "payout_mule_link":
+        steps.append(
+            (
+                "run_sql",
+                {
+                    "query": f"SELECT t2.account_id, a.status, t2.ts, t2.amount FROM transactions t1 JOIN transactions t2 ON t1.destination = t2.destination AND t2.account_id != t1.account_id JOIN accounts a ON a.account_id = t2.account_id WHERE t1.account_id = '{account}' AND t1.type = 'payout'"
+                },
+            )
+        )
+    if archetype in ("bust_out", "legit_vpn_privacy"):
+        steps.append(
+            (
+                "run_sql",
+                {
+                    "query": f"SELECT ts, type, amount, destination, status FROM transactions WHERE account_id = '{account}' ORDER BY ts"
+                },
+            )
+        )
     if archetype in (
         "synthetic_identity",
         "legit_thin_file",
         "account_takeover",
         "legit_traveler",
+        "ato_quiet",
+        "legit_account_recovery",
     ):
         steps.append(("deep_verification", {"account_id": account}))
-    if archetype in ("ring_member", "legit_household"):
+    if archetype in (
+        "ring_member",
+        "legit_household",
+        "payout_mule_link",
+        "bust_out",
+        "legit_account_recovery",
+        "legit_resold_device",
+    ):
         steps.append(("social_network_search", {"account_id": account}))
     decision = "deny" if case["label"] == "fraud" else "approve"
     analysis = (

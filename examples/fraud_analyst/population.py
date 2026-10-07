@@ -16,6 +16,14 @@ ring members share devices with closed fraud accounts (visible in SQL); account 
 new device and country, a password reset and a new payout destination; synthetic identities look
 clean until deep verification; risky-looking legitimate customers (travellers, thin files, shared
 households) clear on deep verification and network search.
+
+A second, hard tier of 12 cases (K-5041 on) is built so the most visible signal points the wrong
+way and the decision rests on joining or weighing evidence: a new account paying out to a bank
+account that closed fraud accounts cashed out to; a domestic takeover the risk model scores low; a
+dormant, verified identity cashing out a burst of deposits from new cards; and, on the legitimate
+side, a phone-loss recovery that looks like a takeover, a second-hand device last used by a
+fraudster years ago, and a long-standing customer who always logs in through a VPN abroad. The
+hard tier draws from its own random stream, so it leaves the first 40 cases unchanged.
 """
 
 from __future__ import annotations
@@ -29,18 +37,38 @@ SEED = 20261007
 HISTORICAL_ACCOUNTS = 320
 RINGS = 8
 
-FRAUD_ARCHETYPES = ("ring_member", "synthetic_identity", "account_takeover")
+HARD_FRAUD_ARCHETYPES = ("payout_mule_link", "ato_quiet", "bust_out")
+HARD_LEGIT_ARCHETYPES = (
+    "legit_account_recovery",
+    "legit_resold_device",
+    "legit_vpn_privacy",
+)
+HARD_ARCHETYPES = (*HARD_FRAUD_ARCHETYPES, *HARD_LEGIT_ARCHETYPES)
+FRAUD_ARCHETYPES = (
+    "ring_member",
+    "synthetic_identity",
+    "account_takeover",
+    *HARD_FRAUD_ARCHETYPES,
+)
 LEGIT_ARCHETYPES = (
     "legit_clean",
     "legit_traveler",
     "legit_thin_file",
     "legit_household",
+    *HARD_LEGIT_ARCHETYPES,
 )
 # The review queue, in order: 40 cases, 20 fraud and 20 legitimate.
 QUEUE = [
     *(["ring_member"] * 7), *(["synthetic_identity"] * 7), *(["account_takeover"] * 6),
     *(["legit_clean"] * 6), *(["legit_traveler"] * 5), *(["legit_thin_file"] * 5), *(["legit_household"] * 4),
 ]  # fmt: skip
+# The hard tier, after it: 12 cases, two of each hard archetype.
+HARD_QUEUE = [archetype for archetype in HARD_ARCHETYPES for _ in range(2)]
+# The production model's score for the hard tier: low on the frauds, high on the legitimate cases.
+HARD_RISK = {
+    "payout_mule_link": (0.25, 0.45), "ato_quiet": (0.12, 0.3), "bust_out": (0.15, 0.35),
+    "legit_account_recovery": (0.6, 0.82), "legit_resold_device": (0.55, 0.78), "legit_vpn_privacy": (0.65, 0.88),
+}  # fmt: skip
 
 FIRST = [
     "Ava",
@@ -109,7 +137,10 @@ def _ts(rng: random.Random, days_ago_lo: int, days_ago_hi: int) -> str:
 
 class _Builder:
     def __init__(self, seed: int) -> None:
+        self.seed = seed
         self.rng = random.Random(seed)
+        self.standard_rng = self.rng
+        self.first_hard_account: int | None = None
         self.accounts: list[dict[str, Any]] = []
         self.logins: list[dict[str, Any]] = []
         self.transactions: list[dict[str, Any]] = []
@@ -339,15 +370,184 @@ class _Builder:
         self.latent[account] = {"fraud": fraud, "archetype": archetype}
         return account, trigger, amount
 
+    def start_hard_phase(self) -> None:
+        """Switch to the hard tier's own random stream, so it leaves the earlier cases unchanged."""
+        self.standard_rng = self.rng
+        self.rng = random.Random(self.seed + 1)
+        self.first_hard_account = len(self.accounts)
+
+    def pending_hard(self, archetype: str) -> tuple[str, str, float]:
+        """Create one flagged account in the hard tier; return (account_id, trigger, amount)."""
+        rng = self.rng
+        home = self.device()
+        latent: dict[str, Any] = {
+            "fraud": archetype in FRAUD_ARCHETYPES,
+            "archetype": archetype,
+        }
+        destination = f"bank-{rng.randint(1000, 9999)}"
+        if archetype == "payout_mule_link":
+            # Closed fraud accounts cashed out to this bank account months ago; the new account
+            # has its own device and a quiet history, and pays out to the same account.
+            for _ in range(rng.randint(2, 3)):
+                prior_age = rng.randint(150, 400)
+                prior = self.new_account(age_days=prior_age, status="closed_fraud")
+                self.latent[prior] = {"fraud": True, "archetype": "historical"}
+                self.login(
+                    prior,
+                    self.device(),
+                    "US",
+                    rng.random() < 0.5,
+                    (90, prior_age),
+                    rng.randint(3, 6),
+                )
+                for _ in range(rng.randint(2, 4)):
+                    self.txn(
+                        prior,
+                        "deposit",
+                        rng.uniform(400, 1500),
+                        (90, prior_age),
+                        status="chargeback",
+                    )
+                self.txn(
+                    prior,
+                    "payout",
+                    rng.uniform(1500, 4000),
+                    (90, min(prior_age, 140)),
+                    destination=destination,
+                )
+            age = rng.randint(25, 80)
+            account = self.new_account(age_days=age, status="pending_review")
+            self.login(account, home, "US", False, (0, age), rng.randint(4, 9))
+            deposits = [rng.uniform(300, 1100) for _ in range(rng.randint(3, 6))]
+            for deposit in deposits:
+                self.txn(account, "deposit", deposit, (1, age))
+            amount = round(sum(deposits) * rng.uniform(0.85, 0.95), 2)
+            trigger = f"First payout from this account (${amount:,.2f}), {age} days after sign-up"
+        elif archetype == "ato_quiet":
+            # A domestic takeover: no VPN, no new country. The owner's own device is still active
+            # while a second device appears, resets the password and adds a bank account.
+            age = rng.randint(900, 2400)
+            account = self.new_account(age_days=age, status="pending_review")
+            self.normal_activity(account, home, age)
+            self.login(account, home, "US", False, (0, 2), rng.randint(1, 3))
+            self.login(account, self.device(), "US", False, (0, 2), rng.randint(2, 4))
+            amount = round(rng.uniform(1600, 4200), 2)
+            trigger = f"Payout of ${amount:,.2f} to a bank account added {rng.choice(['yesterday', '2 days ago'])}"
+        elif archetype == "bust_out":
+            # A real, verified identity: a long-quiet account takes a burst of deposits from
+            # several new cards (reported stolen in the consortium) and cashes them out.
+            age = rng.randint(400, 900)
+            account = self.new_account(age_days=age, status="pending_review")
+            self.login(account, home, "US", False, (20, 300), rng.randint(5, 10))
+            for _ in range(rng.randint(3, 6)):
+                self.txn(account, "purchase", rng.uniform(15, 120), (20, 300))
+            self.login(account, home, "US", False, (0, 9), rng.randint(4, 8))
+            deposits = [rng.uniform(400, 1200) for _ in range(rng.randint(5, 8))]
+            for deposit in deposits:
+                self.txn(
+                    account,
+                    "deposit",
+                    deposit,
+                    (1, 9),
+                    destination=f"card-{rng.randint(1000, 9999)}",
+                )
+            amount = round(sum(deposits) * rng.uniform(0.85, 0.95), 2)
+            trigger = f"Payout of ${amount:,.2f}; the account has never paid out before"
+        elif archetype == "legit_account_recovery":
+            # A lost phone: the old device goes silent, a new one logs in from home, the
+            # customer resets the password and the carrier issues a new SIM.
+            age = rng.randint(700, 2400)
+            account = self.new_account(age_days=age, status="pending_review")
+            self.login(account, home, "US", False, (12, 60), rng.randint(5, 12))
+            for _ in range(rng.randint(3, 10)):
+                self.txn(
+                    account,
+                    rng.choice(["purchase", "purchase", "deposit"]),
+                    rng.uniform(12, 380),
+                    (12, 60),
+                )
+            self.txn(
+                account,
+                "payout",
+                rng.uniform(300, 1200),
+                (12, 60),
+                destination=f"bank-{rng.randint(1000, 9999)}",
+            )
+            self.login(account, self.device(), "US", False, (0, 6), rng.randint(3, 6))
+            amount = round(rng.uniform(900, 2600), 2)
+            trigger = f"Payout of ${amount:,.2f} to a new bank account, requested from a new device after a password reset"
+        elif archetype == "legit_resold_device":
+            # The device's previous owner was closed for fraud long before this account existed.
+            prior_age = rng.randint(800, 1200)
+            prior = self.new_account(age_days=prior_age, status="closed_fraud")
+            self.latent[prior] = {"fraud": True, "archetype": "historical"}
+            self.login(
+                prior, home, "US", rng.random() < 0.5, (500, 750), rng.randint(4, 8)
+            )
+            for _ in range(rng.randint(2, 4)):
+                self.txn(
+                    prior,
+                    "purchase",
+                    rng.uniform(300, 1200),
+                    (500, 750),
+                    status="chargeback",
+                )
+            latent["prior_owner"] = prior
+            age = rng.randint(90, 300)
+            account = self.new_account(age_days=age, status="pending_review")
+            self.normal_activity(account, home, age)
+            amount = round(rng.uniform(800, 2400), 2)
+            trigger = f"Payout of ${amount:,.2f}; the login device was previously used by an account closed for fraud"
+        elif archetype == "legit_vpn_privacy":
+            # Years of logins through one VPN exit abroad on one device, paying out to the same
+            # bank account as always.
+            age = rng.randint(900, 2400)
+            account = self.new_account(age_days=age, status="pending_review")
+            country = rng.choice(RISKY_COUNTRIES)
+            self.login(account, home, country, True, (1, 400), rng.randint(12, 20))
+            self.login(account, home, country, True, (0, 1), rng.randint(1, 2))
+            for _ in range(rng.randint(5, 12)):
+                self.txn(
+                    account,
+                    rng.choice(["purchase", "purchase", "deposit"]),
+                    rng.uniform(12, 380),
+                    (1, 400),
+                )
+            for _ in range(rng.randint(3, 5)):
+                self.txn(
+                    account,
+                    "payout",
+                    rng.uniform(600, 2000),
+                    (20, 400),
+                    destination=destination,
+                )
+            amount = round(rng.uniform(1200, 2600), 2)
+            trigger = (
+                f"Payout of ${amount:,.2f} requested through a VPN exiting in {country}"
+            )
+        else:
+            raise ValueError(archetype)
+        self.txn(
+            account, "payout", amount, (0, 0), status="pending", destination=destination
+        )
+        self.latent[account] = latent
+        return account, trigger, amount
+
     # -- derived data -----------------------------------------------------------------------------
 
     def derive(self) -> None:
-        rng = self.rng
         by_device: dict[str, set[str]] = {}
         for row in self.logins:
             by_device.setdefault(row["device_id"], set()).add(row["account_id"])
         status = {a["account_id"]: a["status"] for a in self.accounts}
-        for account in self.accounts:
+        logins_by_account: dict[str, list[dict[str, Any]]] = {}
+        for row in self.logins:
+            logins_by_account.setdefault(row["account_id"], []).append(row)
+        for index, account in enumerate(self.accounts):
+            hard = (
+                self.first_hard_account is not None and index >= self.first_hard_account
+            )
+            rng = self.rng if hard else self.standard_rng
             account_id, latent = (
                 account["account_id"],
                 self.latent[account["account_id"]],
@@ -365,7 +565,7 @@ class _Builder:
             shared = set().union(
                 *(by_device.get(d, set()) for d in {r["device_id"] for r in logins})
             ) - {account_id}
-            risk = {
+            risk = rng.uniform(*HARD_RISK[archetype]) if archetype in HARD_RISK else {
                 "ring_member": rng.uniform(0.62, 0.9), "synthetic_identity": rng.uniform(0.18, 0.42),
                 "account_takeover": rng.uniform(0.55, 0.85), "legit_clean": rng.uniform(0.05, 0.25),
                 "legit_traveler": rng.uniform(0.5, 0.78), "legit_thin_file": rng.uniform(0.45, 0.7),
@@ -373,15 +573,17 @@ class _Builder:
             }[archetype]  # fmt: skip
             self.features[account_id] = {
                 "account.age_days": age,
-                "account.email_age_days": rng.randint(1, 40) if archetype in ("ring_member", "synthetic_identity") else rng.randint(age, age + 2000),
+                "account.email_age_days": rng.randint(1, 40) if archetype in ("ring_member", "synthetic_identity", "payout_mule_link") else rng.randint(age, age + 2000),
                 "account.risk_score": round(risk, 3),
                 "account.txn_count_30d": sum(1 for t in txns if (TODAY - dt.date.fromisoformat(t["ts"][:10])).days <= 30),
                 "account.chargeback_count_180d": sum(1 for t in txns if t["status"] == "chargeback"),
                 "account.distinct_devices_30d": len(devices),
                 "account.distinct_countries_30d": len({r["ip_country"] for r in recent}),
                 "account.vpn_login_ratio_30d": round(sum(r["vpn"] for r in recent) / len(recent), 2) if recent else 0.0,
-                "account.password_reset_7d": archetype == "account_takeover",
-                "account.new_payout_destination_7d": archetype in ("ring_member", "account_takeover") or rng.random() < 0.15,
+                "account.password_reset_7d": archetype in ("account_takeover", "ato_quiet", "legit_account_recovery"),
+                "account.new_payout_destination_7d": archetype in ("ring_member", "account_takeover", "payout_mule_link", "ato_quiet",
+                                                                  "bust_out", "legit_account_recovery")
+                                                     or (archetype not in HARD_ARCHETYPES and rng.random() < 0.15),
                 "account.device_shared_account_count": len(shared),
                 "account.max_prior_payout_usd": round(max([t["amount"] for t in txns if t["type"] == "payout" and t["status"] == "settled"] or [0.0]), 2),
             }  # fmt: skip
@@ -395,6 +597,15 @@ class _Builder:
                 deep.update(synthetic_identity_score=round(rng.uniform(0.35, 0.65), 2), phone_tenure_months=rng.randint(0, 3),
                             liveness_passed=rng.random() < 0.5)  # fmt: skip
             elif archetype == "account_takeover":
+                deep.update(sim_swap_last_7d=True)
+            elif archetype == "payout_mule_link":
+                deep.update(
+                    synthetic_identity_score=round(rng.uniform(0.3, 0.5), 2),
+                    phone_tenure_months=rng.randint(2, 8),
+                )
+            elif archetype == "ato_quiet":
+                deep.update(sim_swap_last_7d=True, liveness_passed=False)
+            elif archetype == "legit_account_recovery":
                 deep.update(sim_swap_last_7d=True)
             elif archetype == "legit_thin_file":
                 deep.update(
@@ -420,6 +631,25 @@ class _Builder:
                         "status": "confirmed_fraud",
                     }
                 ]
+            elif archetype == "payout_mule_link":
+                links = [{"link_type": "payout_destination", "institution": f"member-{rng.randint(10, 99)}",
+                          "status": "confirmed_fraud"} for _ in range(rng.randint(1, 2))]  # fmt: skip
+            elif archetype == "ato_quiet":
+                links = [
+                    {
+                        "link_type": "device",
+                        "institution": f"member-{rng.randint(10, 99)}",
+                        "status": "confirmed_fraud",
+                    }
+                ]
+            elif archetype == "bust_out":
+                links = [{"link_type": "funding_card", "institution": f"member-{rng.randint(10, 99)}",
+                          "status": "confirmed_fraud"} for _ in range(rng.randint(2, 3))]  # fmt: skip
+            elif archetype == "legit_resold_device":
+                prior = latent["prior_owner"]
+                last_seen = max(r["ts"] for r in logins_by_account[prior])[:10]
+                links = [{"link_type": "device", "institution": "kestrel", "account_id": prior, "status": "closed_fraud",
+                          "last_seen_on_device": last_seen}]  # fmt: skip
             elif archetype == "legit_household":
                 partners = sorted(shared)
                 links = [
@@ -446,6 +676,13 @@ def generate(seed: int = SEED) -> dict[str, Any]:
     cases = []
     for index, archetype in enumerate(QUEUE):
         account, trigger, amount = builder.pending(archetype)
+        cases.append({"case_id": f"K-{5001 + index}", "account_id": account, "trigger": trigger, "amount_usd": amount,
+                      "opened_at": f"{TODAY.isoformat()} 09:{index:02d}", "archetype": archetype,
+                      "label": "fraud" if archetype in FRAUD_ARCHETYPES else "legit"})  # fmt: skip
+    builder.start_hard_phase()
+    for archetype in HARD_QUEUE:
+        index = len(cases)
+        account, trigger, amount = builder.pending_hard(archetype)
         cases.append({"case_id": f"K-{5001 + index}", "account_id": account, "trigger": trigger, "amount_usd": amount,
                       "opened_at": f"{TODAY.isoformat()} 09:{index:02d}", "archetype": archetype,
                       "label": "fraud" if archetype in FRAUD_ARCHETYPES else "legit"})  # fmt: skip

@@ -7,18 +7,18 @@ a Chalk evaluation and scores the decision, the quality of the analysis, and wha
 investigation spent.
 
 ```bash
-./build_tasks.py                                  # population.py -> tasks/<case>/ (40 cases)
+./build_tasks.py                                  # population.py -> tasks/<case>/ (52 cases)
 uv run --with pytest pytest test_cases.py         # every case's reference investigation scores 1.0
-./fraud_eval.py                                   # 12 demo cases as a Chalk evaluation (--all for 40)
+./fraud_eval.py                                   # 12 demo cases as a Chalk evaluation (--hard: the hard tier, --all: 52)
 ./fraud_eval.py --rescore <run-id>                # re-judge an earlier run without re-running agents
 ```
 
 ## The population
 
-`population.py` generates a seeded population: 360 accounts with logins and transactions, of
+`population.py` generates a seeded population: 378 accounts with logins and transactions, of
 which 320 are historical with known outcomes (about 20% fraud, including eight fraud rings that
 share devices), and a review queue of 40 held payouts (20 fraud, 20 legitimate) in seven
-archetypes:
+archetypes, followed by a hard tier of 12 (below):
 
 | Archetype | Label | What settles it |
 | --- | --- | --- |
@@ -32,6 +32,24 @@ archetypes:
 
 The model's `risk_score` is deliberately misleading on synthetic identities and risky-looking
 legitimate customers, so an agent that thresholds the score fails those cases.
+
+### The hard tier
+
+Twelve more cases (K-5041 to K-5052, two per archetype, 6 fraud and 6 legitimate) are built so the
+most visible signal points the wrong way: the risk score is low on every hard fraud and high on
+every hard legitimate case, and the deciding evidence takes a join, a timeline, or weighing one
+paid result against the rest.
+
+| Archetype | Label | The trap | What settles it |
+| --- | --- | --- | --- |
+| `payout_mule_link` | fraud | new account, own device, no shared devices, risk 0.25-0.45 | free: the payout's bank account is where 2-3 closed fraud accounts cashed out (join `transactions` on `destination`); network search shows `payout_destination` links |
+| `ato_quiet` | fraud | long tenure, US, no VPN, risk 0.12-0.3 | a second device appears in the last two days *while the owner's device is still active*, with a password reset and a new bank account; deep verification shows a SIM swap **and failed liveness** |
+| `bust_out` | fraud | verified real identity (deep verification clean), one device, risk 0.15-0.35 | free: a long-quiet account takes 5-8 deposits from different new cards in ten days and cashes nearly all of it out on its first payout; network search reports the cards |
+| `legit_account_recovery` | legit | reads exactly like a takeover: new device, password reset, new bank account, **SIM swap**, risk 0.6-0.8 | the old device went silent before the new one appeared (a replacement, not a second user), liveness passes, no consortium links |
+| `legit_resold_device` | legit | the login device was used by an account closed for fraud; shared-device count 1, risk 0.55-0.78 | the fraudster's last use of the device was a year or more before this account was opened |
+| `legit_vpn_privacy` | legit | every login over a VPN exiting in a high-risk country, risk 0.65-0.88 | the same device and exit country for years, no reset, and the payout goes to the bank account every previous payout went to |
+
+The hard tier draws from its own random stream, so it leaves the first 40 cases byte-for-byte unchanged.
 
 ## What the agent gets
 

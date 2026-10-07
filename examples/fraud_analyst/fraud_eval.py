@@ -8,7 +8,8 @@
 
     ./build_tasks.py
     ./fraud_eval.py                 # the 12 demo cases (6 fraud, 6 legitimate)
-    ./fraud_eval.py --all           # all 40 cases in the review queue
+    ./fraud_eval.py --hard          # the 12 hard-tier cases
+    ./fraud_eval.py --all           # all 52 cases in the review queue
     ./fraud_eval.py --rescore <run-id>
 
 Each row runs ``harbor run`` with the ``FraudAnalystAgent`` harness in a Chalk sandbox (no network;
@@ -374,7 +375,12 @@ def _save(manifest: dict[str, Any], run: chalkcompute.EvaluationRun) -> Path:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--all", action="store_true", help="All 40 cases instead of the 12 demo cases."
+        "--all", action="store_true", help="All 52 cases instead of the 12 demo cases."
+    )
+    parser.add_argument(
+        "--hard",
+        action="store_true",
+        help="The 12 hard-tier cases instead of the 12 demo cases.",
     )
     parser.add_argument(
         "--rescore",
@@ -397,9 +403,18 @@ def main(argv: list[str]) -> int:
         return 0 if str(run.status).endswith("SUCCEEDED") else 1
 
     sys.path.insert(0, str(HERE))
-    from population import generate
+    from population import HARD_ARCHETYPES, generate
 
-    cases = [c for c in generate()["cases"] if args.all or c["case_id"] in DEMO_CASES]
+    cases = [
+        c
+        for c in generate()["cases"]
+        if args.all
+        or (
+            c["archetype"] in HARD_ARCHETYPES
+            if args.hard
+            else c["case_id"] in DEMO_CASES
+        )
+    ]
     client = chalkcompute.VolumeClient.from_env()
     try:
         try:

@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from build_tasks import reference_steps
-from population import generate
+from population import HARD_ARCHETYPES, HARD_QUEUE, generate
 
 TASKS = HERE / "tasks"
 CASES = generate()["cases"]
@@ -146,3 +146,80 @@ def test_closed_case_refuses_more_work(home: Path, tmp_path: Path) -> None:
         {"decision": "deny", "confidence": 0.8, "analysis": "y" * 250},
     )["ok"]
     assert not _call(env, "deep_verification", {"account_id": case["account_id"]})["ok"]
+
+
+HARD = [c for c in CASES if c["archetype"] in HARD_ARCHETYPES]
+
+
+def _sql(env: dict[str, str], query: str) -> list[list]:
+    result = _call(env, "run_sql", {"query": query})
+    assert result["ok"], result
+    return result["rows"]
+
+
+def test_the_hard_tier_follows_the_standard_queue() -> None:
+    assert [c["case_id"] for c in CASES[:40]] == [f"K-{5001 + i}" for i in range(40)]
+    assert [c["archetype"] for c in CASES[40:]] == HARD_QUEUE
+    assert sum(c["label"] == "fraud" for c in HARD) == len(HARD) // 2
+
+
+@pytest.mark.parametrize("case", HARD, ids=[c["case_id"] for c in HARD])
+def test_hard_cases_hinge_on_the_evidence_they_were_built_around(
+    home: Path, case: dict, tmp_path: Path
+) -> None:
+    env = _env(home, case, tmp_path / "state")
+    account, archetype = case["account_id"], case["archetype"]
+    features = _call(env, "chalk_query", {"account_id": account})["features"]
+    risk = features["account.risk_score"]
+    # The production model points the wrong way on every hard case.
+    assert risk < 0.5 if case["label"] == "fraud" else risk > 0.5
+    if archetype == "payout_mule_link":
+        statuses = _sql(
+            env,
+            f"SELECT DISTINCT a.status FROM transactions t1 JOIN transactions t2 ON t1.destination = t2.destination AND t2.account_id != t1.account_id JOIN accounts a ON a.account_id = t2.account_id WHERE t1.account_id = '{account}' AND t1.status = 'pending'",
+        )
+        assert statuses == [["closed_fraud"]]
+        assert features["account.device_shared_account_count"] == 0
+    elif archetype == "ato_quiet":
+        # The owner's device and an unseen device are both active in the last two days, at home.
+        recent = _sql(
+            env,
+            f"SELECT COUNT(DISTINCT device_id), MAX(vpn), GROUP_CONCAT(DISTINCT ip_country) FROM logins WHERE account_id = '{account}' AND ts >= '2026-10-05'",
+        )
+        assert recent == [[2, 0, "US"]]
+    elif archetype == "bust_out":
+        cards = _sql(
+            env,
+            f"SELECT COUNT(DISTINCT destination) FROM transactions WHERE account_id = '{account}' AND type = 'deposit' AND ts >= '2026-09-27'",
+        )[0][0]
+        assert cards >= 5
+        assert _sql(
+            env,
+            f"SELECT COUNT(*) FROM transactions WHERE account_id = '{account}' AND type = 'payout' AND status = 'settled'",
+        ) == [[0]]
+    elif archetype == "legit_account_recovery":
+        # The old device went silent before the new one appeared: a replacement, not a second user.
+        spans = _sql(
+            env,
+            f"SELECT device_id, MIN(ts), MAX(ts) FROM logins WHERE account_id = '{account}' GROUP BY 1 ORDER BY 2",
+        )
+        assert len(spans) == 2 and spans[0][2] < spans[1][1]
+    elif archetype == "legit_resold_device":
+        # The fraudster's last use of the device predates this account.
+        rows = _sql(
+            env,
+            f"SELECT a2.status, MAX(l2.ts), a1.created_at FROM logins l1 JOIN logins l2 ON l1.device_id = l2.device_id AND l2.account_id != l1.account_id JOIN accounts a1 ON a1.account_id = l1.account_id JOIN accounts a2 ON a2.account_id = l2.account_id WHERE l1.account_id = '{account}' GROUP BY l2.account_id",
+        )
+        assert (
+            len(rows) == 1 and rows[0][0] == "closed_fraud" and rows[0][1] < rows[0][2]
+        )
+    elif archetype == "legit_vpn_privacy":
+        assert _sql(
+            env,
+            f"SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT ip_country), MIN(vpn) FROM logins WHERE account_id = '{account}'",
+        ) == [[1, 1, 1]]
+        prior = _sql(
+            env,
+            f"SELECT COUNT(*) FROM transactions p JOIN transactions h ON h.account_id = p.account_id AND h.destination = p.destination AND h.status = 'settled' WHERE p.account_id = '{account}' AND p.status = 'pending'",
+        )
+        assert prior[0][0] >= 3
