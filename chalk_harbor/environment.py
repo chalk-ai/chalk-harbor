@@ -63,6 +63,8 @@ from harbor.environments.tar_transfer import (
 from harbor.models.task.config import EnvironmentConfig, NetworkMode
 from harbor.models.trial.paths import TrialPaths
 
+from chalk_harbor.evaluation import sandbox_tags
+
 # Largest compressed context one COPY may embed. Build steps travel inside the image spec,
 # so an unbounded payload would turn a stray COPY of a dataset into an opaque RPC failure.
 _EMBED_BUDGET_BYTES = 4 * 1024 * 1024
@@ -192,7 +194,8 @@ class ChalkSandboxEnvironment(BaseEnvironment):
             volumes=self._volumes or None,
             network_policy=self._sandbox_network_policy(),
             lifetime=self._lifetime,
-            tags={"harbor.session": _label_value(self.session_id)},
+            # Inside a Chalk evaluation, the evaluation, run and row the trial belongs to.
+            tags={"harbor.session": _label_value(self.session_id), **sandbox_tags()},
         )
         self.logger.debug(
             f"Chalk sandbox {self._sandbox.id} started for {self.session_id}"
