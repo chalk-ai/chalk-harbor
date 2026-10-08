@@ -1,13 +1,15 @@
-"""A Harbor agent that works a Larkspur support ticket with tools, against a simulated customer.
+"""An agent that works a Larkspur support ticket with tools, against a simulated customer.
 
-    harbor run -p tasks -a support_agent:LarkspurSupportAgent -m anthropic/claude-haiku-4-5 \\
-        -e chalk_harbor:ChalkSandboxEnvironment
+    sandbox = Sandbox(image=SANDBOX_IMAGE, env={"HELPDESK_TICKET": ticket}, network_policy=NetworkPolicy()).run()
+    sandbox.fs.write_bytes(f"/opt/helpdesk/scenarios/{ticket}.json", sealed_record)
+    chat = SupportAgent(sandbox, model="anthropic/claude-haiku-4-5").run(instruction)
+    grade, ledger = grade_ticket(sandbox, rubric)
 
-The agent loop and the simulated customer run here, in Harbor's process, where the model
-endpoint is reachable. Everything the agent *does* runs in the trial's sandbox, which has no
-network: python and bash execute there as an unprivileged user, and every support action goes
-through the sandbox's ``helpdesk`` backend, which validates it and appends it to the ticket's
-ledger. The verifier grades that ledger, so nothing the harness says about itself is trusted.
+The agent loop and the simulated customer run in the calling process, where the model endpoint
+is reachable. Everything the agent *does* runs in the Chalk sandbox: python and bash execute
+there as an unprivileged user, and every support action goes through the sandbox's ``helpdesk``
+backend, which validates it and appends it to the ticket's ledger. The grade comes from that
+ledger, so nothing the agent says about itself is trusted.
 
 The simulated customer is a second model playing the persona sealed in the sandbox (readable
 only by root, so not by the agent's tools). It answers each ``send_message_to_customer`` call,
@@ -18,14 +20,14 @@ Models are called through an OpenAI-compatible endpoint: ``OPENAI_BASE_URL`` and
 ``OPENAI_API_KEY`` (Chalk's AI router accepts a Chalk token as the key; ``CHALK_ENVIRONMENT_ID``
 is then sent as ``X-Chalk-Env-Id``).
 
-Output, in the trial's ``agent/`` directory: ``trajectory.json`` (ATIF, one step per model
-turn with its tool calls and results) and ``conversation.json`` (the chat as the customer saw
-it, with the customer's frustration after each reply and the survey answer).
+Each model turn and tool call is an OpenInference span under the current span, so inside a
+Chalk evaluation the row's trace shows the agent as it works. The run also returns the chat as
+the customer saw it and an ATIF trajectory (one step per model turn with its tool calls and
+results), the format the post-trainer reads.
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import datetime as dt
 import json
@@ -36,27 +38,29 @@ import time
 from pathlib import Path
 from typing import Any
 
-from harbor.agents.base import BaseAgent
-from harbor.agents.capabilities import AgentCapabilities
-from harbor.agents.options import AgentOptions
-from harbor.environments.base import BaseEnvironment
-from harbor.models.agent.context import AgentContext
-from harbor.models.trajectories import (
-    Agent,
-    FinalMetrics,
-    Metrics,
-    Observation,
-    ObservationResult,
-    Step,
-    ToolCall,
-    Trajectory,
-)
-from openai import APIConnectionError, APIStatusError, AsyncOpenAI
-from pydantic import Field
+from chalkcompute import Image, Sandbox
+from openai import APIConnectionError, APIStatusError, OpenAI
+from opentelemetry import trace
 
 SANDBOX_USER = "agent"
 TOOL_TIMEOUT_SEC = 20
 MAX_OUTPUT_CHARS = 6000
+# Attribute values are capped so one huge observation cannot blow the span size limit.
+MAX_SPAN_VALUE_CHARS = 16_000
+
+# The helpdesk backend and knowledge base, mounted into every sandbox. The agent's tools run as
+# an unprivileged user; the ticket's sealed record (scenarios/) and the ledger are root-only.
+HELPDESK = Path(__file__).resolve().parent / "helpdesk"
+SANDBOX_IMAGE = (
+    Image.debian_slim("3.13")
+    .run_commands(
+        f"useradd --create-home --shell /bin/bash {SANDBOX_USER}",
+        "install -d -m 700 /opt/helpdesk/scenarios /var/lib/helpdesk",
+    )
+    .add_local_dir(str(HELPDESK / "bin"), "/opt/helpdesk/bin")
+    .add_local_dir(str(HELPDESK / "lib"), "/opt/helpdesk/lib", exclude=["__pycache__"])
+    .add_local_dir(str(HELPDESK / "kb"), "/opt/helpdesk/kb")
+)
 
 SYSTEM_PROMPT = """\
 You are a Tier-1 customer support agent at Larkspur Home Delivery & Installation, a company that \
@@ -211,18 +215,6 @@ The customer cannot see that text. Use send_message_to_customer to talk to them,
 to act, and end_conversation to finish."""
 
 
-class SupportAgentOptions(AgentOptions):
-    customer_model: str = Field(
-        default="openai/gpt-5.4-mini", description="Model playing the customer."
-    )
-    max_customer_turns: int = Field(
-        default=8, description="Customer replies before the customer leaves."
-    )
-    max_steps: int = Field(
-        default=40, description="Agent model calls before the run is cut off."
-    )
-
-
 def _now() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
 
@@ -231,12 +223,8 @@ def _b64(value: Any) -> str:
     return base64.b64encode(json.dumps(value).encode()).decode()
 
 
-def _truncate(text: str) -> str:
-    return (
-        text
-        if len(text) <= MAX_OUTPUT_CHARS
-        else text[:MAX_OUTPUT_CHARS] + "\n...[truncated]"
-    )
+def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    return text if len(text) <= limit else text[:limit] + "\n...[truncated]"
 
 
 def _parse_json(text: str) -> dict[str, Any]:
@@ -264,35 +252,89 @@ def _describe_orders(orders: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-class LarkspurSupportAgent(BaseAgent):
-    capabilities = AgentCapabilities(atif=True)
-    options_model = SupportAgentOptions
+def _set(span: trace.Span, attributes: dict[str, Any]) -> None:
+    for key, value in attributes.items():
+        if value is not None:
+            span.set_attribute(
+                key,
+                _truncate(value, MAX_SPAN_VALUE_CHARS)
+                if isinstance(value, str)
+                else value,
+            )
 
-    @staticmethod
-    def name() -> str:
-        return "larkspur-support"
 
-    def version(self) -> str:
-        return "1.0.0"
+# -- the sandbox -------------------------------------------------------------------------------
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        options = (
-            self.options
-            if isinstance(self.options, SupportAgentOptions)
-            else SupportAgentOptions()
-        )
-        self._opts = options
-        headers = {}
-        if os.environ.get("CHALK_ENVIRONMENT_ID"):
-            headers["X-Chalk-Env-Id"] = os.environ["CHALK_ENVIRONMENT_ID"]
-        self._client = AsyncOpenAI(
-            base_url=os.environ.get("OPENAI_BASE_URL"),
-            api_key=os.environ.get("OPENAI_API_KEY"),
-            default_headers=headers or None,
-            timeout=180,
-        )
-        self._steps: list[Step] = []
+
+def sh(sandbox: Sandbox, command: str, *, user: str = "root", timeout: int = 60) -> tuple[int, str]:
+    """Run ``command`` under bash as ``user``; the exit code and stdout (+ labeled stderr)."""
+    if user != "root":
+        # The sandbox exec API has no user field; drop privileges inside the shell.
+        command = f"su -s /bin/bash {shlex.quote(user)} -c {shlex.quote(command)}"
+    result = sandbox.exec("bash", "-c", command, timeout_secs=timeout)
+    output = result.stdout_text
+    if result.stderr_text.strip():
+        output += ("\n" if output else "") + "[stderr]\n" + result.stderr_text.strip()
+    # A signal-killed process (e.g. timeout) has no exit code; report it like a shell would.
+    code = result.exit_code if result.exit_code is not None else 128 + (result.signal or 1)
+    return code, output
+
+
+def helpdesk(sandbox: Sandbox, command: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A ``helpdesk`` command as the support platform (root), parsed from its JSON reply."""
+    suffix = f" --b64 {_b64(args)}" if args is not None else ""
+    code, out = sh(sandbox, f"bash /opt/helpdesk/bin/helpdesk {command}{suffix}")
+    if code != 0:
+        return {"ok": False, "error": out.strip()[-500:]}
+    return _parse_json(out) or {"ok": False, "error": out[-500:]}
+
+
+def grade_ticket(sandbox: Sandbox, rubric: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Grade the ticket's ledger against ``rubric``: the grade, and the ledger itself."""
+    sandbox.fs.write_bytes("/tmp/rubric.json", json.dumps(rubric).encode())
+    code, out = sh(sandbox, "bash /opt/helpdesk/bin/helpdesk grade --rubric /tmp/rubric.json --out /tmp/grade")
+    if code != 0:
+        raise RuntimeError(f"grading failed: {out}")
+    ledger = sandbox.fs.read_bytes("/tmp/grade/ledger.jsonl").decode()
+    return (
+        json.loads(sandbox.fs.read_bytes("/tmp/grade/grade.json")),
+        [json.loads(line) for line in ledger.splitlines() if line.strip()],
+    )
+
+
+# -- the agent ---------------------------------------------------------------------------------
+
+
+class SupportAgent:
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        *,
+        model: str,
+        customer_model: str = "openai/gpt-5.4-mini",
+        max_customer_turns: int = 8,
+        max_steps: int = 40,
+        client: OpenAI | None = None,
+    ) -> None:
+        self.sandbox = sandbox
+        self.model = model
+        self.customer_model = customer_model
+        self.max_customer_turns = max_customer_turns
+        self.max_steps = max_steps
+        if client is None:
+            headers = {}
+            if os.environ.get("CHALK_ENVIRONMENT_ID"):
+                headers["X-Chalk-Env-Id"] = os.environ["CHALK_ENVIRONMENT_ID"]
+            client = OpenAI(
+                base_url=os.environ.get("OPENAI_BASE_URL"),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                default_headers=headers or None,
+                timeout=180,
+            )
+        self._client = client
+        self._closed = False
+        self._tracer = trace.get_tracer("larkspur")
+        self._steps: list[dict[str, Any]] = []
         self._usage = {"prompt": 0, "completion": 0, "cached": 0}
         self._conversation: list[dict[str, Any]] = []
         self._customer_messages: list[dict[str, str]] = []
@@ -301,21 +343,37 @@ class LarkspurSupportAgent(BaseAgent):
         self._survey: dict[str, Any] | None = None
         self._profile: dict[str, Any] = {}
 
-    async def setup(self, environment: BaseEnvironment) -> None:
-        result = await environment.exec(
-            "helpdesk sim-profile", user="root", timeout_sec=60
-        )
-        if result.return_code != 0:
-            raise RuntimeError(
-                f"helpdesk is not available in the sandbox: {result.stderr or result.stdout}"
-            )
-        self._profile = json.loads(result.stdout)
+    # -- the conversation ----------------------------------------------------------------------
 
-    # -- the conversation --------------------------------------------------------------------
+    def run(self, instruction: str) -> dict[str, Any]:
+        """Work the ticket; the conversation, survey, token usage and ATIF trajectory."""
+        with self._tracer.start_as_current_span("larkspur.agent") as span:
+            _set(span, {"openinference.span.kind": "AGENT", "input.value": instruction,
+                        "llm.model_name": self.model})  # fmt: skip
+            self._run(instruction)
+            result = self.result()
+            _set(span, {"output.value": json.dumps(result["survey"], default=str)})
+            return result
 
-    async def run(
-        self, instruction: str, environment: BaseEnvironment, context: AgentContext
-    ) -> None:
+    def result(self) -> dict[str, Any]:
+        """What happened so far: also complete after `run` raised, up to the failure."""
+        return {
+            "ticket": self._profile.get("ticket"),
+            "agent_model": self.model,
+            "customer_model": self.customer_model,
+            "closed": self._closed,
+            "transcript": self._conversation,
+            "customer_turns": self._customer_turns,
+            "customer_left": self._customer_done,
+            "survey": self._survey,
+            "tokens": self._usage,
+            "trajectory": self._trajectory(),
+        }
+
+    def _run(self, instruction: str) -> None:
+        self._profile = helpdesk(self.sandbox, "sim-profile")
+        if "sim" not in self._profile:
+            raise RuntimeError(f"helpdesk is not available in the sandbox: {self._profile}")
         sim = self._profile["sim"]
         start = _MOOD_FRUSTRATION.get(sim["mood"], 5)
         self._customer_messages = [{"role": "system", "content": CUSTOMER_PROMPT.format(
@@ -324,141 +382,115 @@ class LarkspurSupportAgent(BaseAgent):
             irate_if="; ".join(sim["irate_if"]), calms_if="; ".join(sim["calms_if"]),
             orders=_describe_orders(self._profile["orders"]), inbound=self._profile["inbound"], start=start)}]  # fmt: skip
         self._conversation.append(
-            {
-                "role": "customer",
-                "text": self._profile["inbound"],
-                "frustration": start,
-                "at": _now(),
-            }
+            {"role": "customer", "text": self._profile["inbound"], "frustration": start, "at": _now()}
         )
-        await self._helpdesk(
-            environment,
-            "customer-say",
-            {"text": self._profile["inbound"], "frustration": start},
-        )
+        helpdesk(self.sandbox, "customer-say", {"text": self._profile["inbound"], "frustration": start})
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": instruction},
         ]
-        self._steps.append(
-            Step(step_id=1, timestamp=_now(), source="user", message=instruction)
-        )
-        closed = False
+        self._steps.append({"step_id": 1, "timestamp": _now(), "source": "user", "message": instruction})
         nudges = 0
         try:
-            for _ in range(self._opts.max_steps):
-                response = await self._complete(
-                    model=self.model_name, messages=messages, tools=TOOLS
-                )
+            for _ in range(self.max_steps):
+                response = self._agent_turn(messages)
                 reply = response.choices[0].message
-                self._count(response)
                 calls = reply.tool_calls or []
                 messages.append(
-                    reply.model_dump(
-                        exclude_none=True, exclude={"audio", "refusal", "annotations"}
-                    )
+                    reply.model_dump(exclude_none=True, exclude={"audio", "refusal", "annotations"})
                 )
-                step = Step(
-                    step_id=len(self._steps) + 1, timestamp=_now(), source="agent", model_name=self.model_name,
-                    message=reply.content or "",
-                    tool_calls=[ToolCall(tool_call_id=c.id, function_name=c.function.name,
-                                         arguments=_parse_json(c.function.arguments)) for c in calls] or None,
-                    metrics=self._metrics(response),
-                )  # fmt: skip
+                step: dict[str, Any] = {
+                    "step_id": len(self._steps) + 1, "timestamp": _now(), "source": "agent",
+                    "model_name": self.model, "message": reply.content or "",
+                    "metrics": self._metrics(response),
+                }  # fmt: skip
+                if calls:
+                    step["tool_calls"] = [
+                        {"tool_call_id": c.id, "function_name": c.function.name,
+                         "arguments": _parse_json(c.function.arguments)}
+                        for c in calls
+                    ]  # fmt: skip
                 self._steps.append(step)
                 if not calls:
                     nudges += 1
                     if nudges > 3:
                         break
-                    nudge = NUDGE
-                    messages.append({"role": "user", "content": nudge})
-                    self._steps.append(
-                        Step(
-                            step_id=len(self._steps) + 1,
-                            timestamp=_now(),
-                            source="user",
-                            message=nudge,
-                        )
-                    )
-                    self._write()
+                    messages.append({"role": "user", "content": NUDGE})
+                    self._steps.append({"step_id": len(self._steps) + 1, "timestamp": _now(),
+                                        "source": "user", "message": NUDGE})  # fmt: skip
                     continue
                 results = []
                 for call in calls:
-                    output = await self._run_tool(
-                        environment,
-                        call.function.name,
-                        _parse_json(call.function.arguments),
-                    )
-                    messages.append(
-                        {"role": "tool", "tool_call_id": call.id, "content": output}
-                    )
-                    results.append(
-                        ObservationResult(source_call_id=call.id, content=output)
-                    )
-                    if call.function.name == "end_conversation" and output.startswith(
-                        '{"ok": true'
-                    ):
-                        closed = True
-                step.observation = Observation(results=results)
-                self._write()
-                if closed:
+                    output = self._run_tool(call.function.name, _parse_json(call.function.arguments))
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+                    results.append({"source_call_id": call.id, "content": output})
+                    if call.function.name == "end_conversation" and output.startswith('{"ok": true'):
+                        self._closed = True
+                step["observation"] = {"results": results}
+                if self._closed:
                     break
         finally:
             if self._survey is None:
-                self._survey = await self._take_survey()
-            context.n_input_tokens = self._usage["prompt"]
-            context.n_output_tokens = self._usage["completion"]
-            context.n_cache_tokens = self._usage["cached"]
-            context.metadata = {
-                "closed": closed,
-                "customer_turns": self._customer_turns,
-                "customer_left": self._customer_done,
-                "final_frustration": self._conversation[-1].get("frustration")
-                if self._conversation
-                else None,
-                "survey": self._survey,
-            }
-            self._write()
+                self._survey = self._take_survey()
 
-    async def _run_tool(
-        self, environment: BaseEnvironment, name: str, args: dict[str, Any]
-    ) -> str:
+    def _agent_turn(self, messages: list[dict[str, Any]]) -> Any:
+        with self._tracer.start_as_current_span(self.model) as span:
+            response = self._complete(model=self.model, messages=messages, tools=TOOLS)
+            self._count(response)
+            reply = response.choices[0].message
+            metrics = self._metrics(response) or {}
+            _set(span, {
+                "openinference.span.kind": "LLM",
+                "llm.model_name": self.model,
+                "llm.provider": self.model.split("/", 1)[0] if "/" in self.model else None,
+                "llm.token_count.prompt": metrics.get("prompt_tokens"),
+                "llm.token_count.completion": metrics.get("completion_tokens"),
+                "llm.token_count.prompt_details.cache_read": metrics.get("cached_tokens"),
+                "output.value": reply.content or None,
+            })  # fmt: skip
+            return response
+
+    def _run_tool(self, name: str, args: dict[str, Any]) -> str:
+        with self._tracer.start_as_current_span(name) as span:
+            _set(span, {"openinference.span.kind": "TOOL", "tool.name": name,
+                        "input.value": json.dumps(args, default=str),
+                        "input.mime_type": "application/json"})  # fmt: skip
+            output = self._dispatch_tool(name, args)
+            _set(span, {"output.value": output})
+            return output
+
+    def _dispatch_tool(self, name: str, args: dict[str, Any]) -> str:
         if name == "search_knowledge_base":
             top_k = int(args.get("top_k") or 3)
             command = f"helpdesk kb-search --top-k {top_k} -- {shlex.quote(str(args.get('query', '')))}"
-            return await self._shell(environment, command, user=SANDBOX_USER)
+            return self._shell(command)
         if name == "run_python":
             encoded = base64.b64encode(str(args.get("code", "")).encode()).decode()
             command = " && ".join([
                 "cd ~", f"echo {encoded} | base64 -d > /tmp/snippet.py", f"ulimit -t {TOOL_TIMEOUT_SEC}",
                 f"timeout {TOOL_TIMEOUT_SEC} python3 /tmp/snippet.py",
             ])  # fmt: skip
-            return await self._shell(environment, command, user=SANDBOX_USER)
+            return self._shell(command)
         if name == "run_bash":
             command = f"cd ~ && timeout {TOOL_TIMEOUT_SEC} bash -c {shlex.quote(str(args.get('command', '')))}"
-            return await self._shell(environment, command, user=SANDBOX_USER)
+            return self._shell(command)
         if name == "send_message_to_customer":
-            return await self._message_customer(
-                environment, str(args.get("message", ""))
-            )
+            return self._message_customer(str(args.get("message", "")))
         if name in HELPDESK_ACTIONS:
-            result = await self._helpdesk(environment, f"call {name}", args)
-            return json.dumps(result)
+            return json.dumps(helpdesk(self.sandbox, f"call {name}", args))
         return json.dumps({"ok": False, "error": f"unknown tool {name}"})
 
-    async def _message_customer(self, environment: BaseEnvironment, text: str) -> str:
+    def _message_customer(self, text: str) -> str:
         if self._customer_done:
             return "[The customer has left the chat and will not see this message.]"
-        result = await self._helpdesk(
-            environment, "call send_message_to_customer", {"message": text}
-        )
+        result = helpdesk(self.sandbox, "call send_message_to_customer", {"message": text})
         if not result.get("ok"):
             return json.dumps(result)
         self._conversation.append({"role": "agent", "text": text, "at": _now()})
         self._customer_messages.append({"role": "user", "content": text})
-        response = await self._complete(model=self._opts.customer_model, messages=self._customer_messages,
-                                        response_format={"type": "json_object"})  # fmt: skip
+        response = self._complete(model=self.customer_model, messages=self._customer_messages,
+                                  response_format={"type": "json_object"})  # fmt: skip
         raw = response.choices[0].message.content or ""
         self._customer_messages.append({"role": "assistant", "content": raw})
         parsed = _parse_json(raw)
@@ -466,34 +498,23 @@ class LarkspurSupportAgent(BaseAgent):
         frustration = parsed.get("frustration")
         self._customer_turns += 1
         self._customer_done = (
-            bool(parsed.get("done"))
-            or self._customer_turns >= self._opts.max_customer_turns
+            bool(parsed.get("done")) or self._customer_turns >= self.max_customer_turns
         )
         self._conversation.append(
-            {
-                "role": "customer",
-                "text": reply,
-                "frustration": frustration,
-                "at": _now(),
-            }
+            {"role": "customer", "text": reply, "frustration": frustration, "at": _now()}
         )
-        await self._helpdesk(
-            environment, "customer-say", {"text": reply, "frustration": frustration}
-        )
+        helpdesk(self.sandbox, "customer-say", {"text": reply, "frustration": frustration})
         if self._customer_done:
             return f"Customer: {reply}\n[The customer has left the chat. Finish any remaining actions, then call end_conversation.]"
         return f"Customer: {reply}"
 
-    async def _take_survey(self) -> dict[str, Any]:
+    def _take_survey(self) -> dict[str, Any]:
         if len(self._customer_messages) < 1:
             return {}
         try:
-            response = await self._complete(
-                model=self._opts.customer_model,
-                messages=[
-                    *self._customer_messages,
-                    {"role": "user", "content": SURVEY_PROMPT},
-                ],
+            response = self._complete(
+                model=self.customer_model,
+                messages=[*self._customer_messages, {"role": "user", "content": SURVEY_PROMPT}],
                 response_format={"type": "json_object"},
             )
         except Exception as exc:  # noqa: BLE001 - a missing survey must not fail the trial
@@ -503,50 +524,23 @@ class LarkspurSupportAgent(BaseAgent):
 
     # -- plumbing ------------------------------------------------------------------------------
 
-    async def _helpdesk(
-        self, environment: BaseEnvironment, command: str, args: dict[str, Any]
-    ) -> dict[str, Any]:
-        result = await environment.exec(
-            f"helpdesk {command} --b64 {_b64(args)}", user="root", timeout_sec=60
-        )
-        if result.return_code != 0:
-            return {
-                "ok": False,
-                "error": (result.stderr or result.stdout).strip()[-500:],
-            }
-        return _parse_json(result.stdout) or {
-            "ok": False,
-            "error": result.stdout[-500:],
-        }
-
-    async def _shell(
-        self, environment: BaseEnvironment, command: str, *, user: str
-    ) -> str:
-        result = await environment.exec(
-            command, user=user, timeout_sec=TOOL_TIMEOUT_SEC + 15
-        )
-        output = result.stdout or ""
-        if result.stderr:
-            output += ("\n" if output else "") + "[stderr]\n" + result.stderr
-        if result.return_code != 0:
-            output += f"\n[exit code {result.return_code}]"
+    def _shell(self, command: str) -> str:
+        code, output = sh(self.sandbox, command, user=SANDBOX_USER, timeout=TOOL_TIMEOUT_SEC + 15)
+        if code != 0:
+            output += f"\n[exit code {code}]"
         return _truncate(output.strip() or "(no output)")
 
-    async def _complete(self, **request: Any) -> Any:
+    def _complete(self, **request: Any) -> Any:
         delay = 2.0
         for attempt in range(5):
             try:
-                return await self._client.chat.completions.create(**request)
+                return self._client.chat.completions.create(**request)
             except (APIConnectionError, APIStatusError) as exc:
                 status = getattr(exc, "status_code", None)
-                if attempt == 4 or (
-                    status is not None and status < 500 and status != 429
-                ):
+                if attempt == 4 or (status is not None and status < 500 and status != 429):
                     raise
-                self.logger.warning(
-                    f"model call failed ({exc}); retrying in {delay:.0f}s"
-                )
-                await asyncio.sleep(delay)
+                print(f"model call failed ({exc}); retrying in {delay:.0f}s", flush=True)
+                time.sleep(delay)
                 delay *= 2
         raise AssertionError("unreachable")
 
@@ -557,51 +551,27 @@ class LarkspurSupportAgent(BaseAgent):
         self._usage["prompt"] += usage.prompt_tokens or 0
         self._usage["completion"] += usage.completion_tokens or 0
         details = getattr(usage, "prompt_tokens_details", None)
-        self._usage["cached"] += (
-            (getattr(details, "cached_tokens", 0) or 0) if details else 0
-        )
+        self._usage["cached"] += (getattr(details, "cached_tokens", 0) or 0) if details else 0
 
     @staticmethod
-    def _metrics(response: Any) -> Metrics | None:
+    def _metrics(response: Any) -> dict[str, Any] | None:
         usage = response.usage
         if usage is None:
             return None
         details = getattr(usage, "prompt_tokens_details", None)
-        return Metrics(prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
-                       cached_tokens=getattr(details, "cached_tokens", None) if details else None)  # fmt: skip
+        return {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens,
+                "cached_tokens": getattr(details, "cached_tokens", None) if details else None}  # fmt: skip
 
-    def _write(self) -> None:
-        trajectory = Trajectory(
-            session_id=self.session_id or "larkspur",
-            agent=Agent(name=self.name(), version=self.version(), model_name=self.model_name, tool_definitions=TOOLS,
-                        extra={"system_prompt": SYSTEM_PROMPT, "customer_model": self._opts.customer_model}),
-            steps=self._steps,
-            final_metrics=FinalMetrics(total_prompt_tokens=self._usage["prompt"],
-                                       total_completion_tokens=self._usage["completion"],
-                                       total_cached_tokens=self._usage["cached"], total_steps=len(self._steps)),
-        )  # fmt: skip
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_write(
-            self.logs_dir / "trajectory.json",
-            trajectory.model_dump_json(exclude_none=True, indent=2),
-        )
-        conversation = {
-            "ticket": self._profile.get("ticket"),
-            "agent_model": self.model_name,
-            "customer_model": self._opts.customer_model,
-            "transcript": self._conversation,
-            "customer_turns": self._customer_turns,
-            "customer_left": self._customer_done,
-            "survey": self._survey,
-            "tokens": self._usage,
-        }
-        _atomic_write(
-            self.logs_dir / "conversation.json", json.dumps(conversation, indent=2)
-        )
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    # The span streamer polls trajectory.json while the trial runs; never let it read half a file.
-    tmp = path.with_suffix(f".{os.getpid()}.{time.monotonic_ns()}.tmp")
-    tmp.write_text(text)
-    tmp.replace(path)
+    def _trajectory(self) -> dict[str, Any]:
+        return {
+            "schema_version": "ATIF-v1.4",
+            "session_id": self._profile.get("ticket") or "larkspur",
+            "agent": {"name": "larkspur-support", "version": "2.0.0", "model_name": self.model,
+                      "tool_definitions": TOOLS,
+                      "extra": {"system_prompt": SYSTEM_PROMPT, "customer_model": self.customer_model}},
+            "steps": self._steps,
+            "final_metrics": {"total_prompt_tokens": self._usage["prompt"],
+                              "total_completion_tokens": self._usage["completion"],
+                              "total_cached_tokens": self._usage["cached"],
+                              "total_steps": len(self._steps)},
+        }  # fmt: skip

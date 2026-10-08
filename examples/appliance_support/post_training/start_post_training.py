@@ -30,15 +30,15 @@ SERVICE = "chalk.evaluation.v1.EvaluationService"
 # Scorer id -> reward weight. Policy compliance is what the business needs; cost of service
 # keeps "compliant" from meaning "refund everything"; the LLM judges and the survey shape the
 # conversation but are noisier, so they weigh less; an irate customer is a penalty. The raw
-# dollar figure (`cost-of-service-usd`) is unbounded, so it stays out: `larkspur-cost-of-service`
+# dollar figure (`cost_of_service_usd`) is unbounded, so it stays out: `cost_of_service`
 # already maps it into [0, 1].
 REWARD_WEIGHTS = {
-    "larkspur-policy-compliance": 1.0,
-    "larkspur-cost-of-service": 0.5,
-    "larkspur-agent-claims-accurate": 0.2,
-    "larkspur-customer-satisfied": 0.15,
-    "larkspur-csat-survey": 0.1,
-    "larkspur-customer-got-irate": -0.3,
+    "policy_compliance": 1.0,
+    "cost_of_service": 0.5,
+    "agent_claims_accurate": 0.2,
+    "customer_satisfied": 0.15,
+    "csat_survey": 0.1,
+    "customer_got_irate": -0.3,
 }
 
 

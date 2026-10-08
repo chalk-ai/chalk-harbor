@@ -16,13 +16,13 @@ import sys
 from pathlib import Path
 
 SCORERS = {
-    "policy": "larkspur-policy-compliance",
-    "cost score": "larkspur-cost-of-service",
+    "policy": "policy_compliance",
+    "cost score": "cost_of_service",
     "cost $": "cost_of_service_usd",
-    "irate": "larkspur-customer-got-irate",
-    "satisfied": "larkspur-customer-satisfied",
-    "survey": "larkspur-csat-survey",
-    "claims ok": "larkspur-agent-claims-accurate",
+    "irate": "customer_got_irate",
+    "satisfied": "customer_satisfied",
+    "survey": "csat_survey",
+    "claims ok": "agent_claims_accurate",
 }
 
 
