@@ -11,7 +11,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("peft")
 pytest.importorskip("transformers")
 
-from chalk_harbor.post_training.config import TrainerConfig
+from chalk_harbor.post_training.config import TrainerConfig, TrainerConfigError
 from chalk_harbor.post_training.grpo import (
     TrainingExample,
     accumulate_and_step,
@@ -282,7 +282,7 @@ def test_an_iteration_trains_saves_and_serves_the_adapter(
         "learning_rate",
         "response_length",
     }
-    assert tags == {"post_training_id": "ptr1", "iteration": "0"}
+    assert tags == {"post_training_id": "ptr1", "iteration": "0", "method": "grpo"}
     files, metadata, buffers = fake.checkpoints[0]
     assert files == ["README.md", "adapter_config.json", "adapter_model.safetensors"]
     assert metadata["adapter_name"] == "adapter-ptr1-1"
@@ -324,3 +324,53 @@ def test_an_iteration_without_reward_spread_fails_loudly(
     with pytest.raises(RuntimeError, match="reward spread"):
         run_iteration(config, None, fake.io())
     assert fake.loads == []
+
+
+def test_an_sft_iteration_trains_on_the_best_rollouts(
+    tmp_path: Path,
+    tiny_tokenizer: Any,
+    make_trajectory: Callable[[str], dict[str, Any]],
+) -> None:
+    adapters = tmp_path / "adapters"
+    fake = FakeIO(tiny_tokenizer, _trajectories(make_trajectory), tmp_path / "ckpt")
+    raw = _raw_config(adapters, 0)
+    raw["method"] = "sft"
+    raw["sft_min_reward"] = 0.5
+
+    summary = run_iteration(TrainerConfig.from_mapping(raw), None, fake.io())
+
+    # Sample 0 scores 0.0 and sample 1 scores 0.75 on the first two tasks; the third task
+    # scores 1.0 in both samples. Four rollouts reach the threshold, across every group, and
+    # one of their trajectories is missing.
+    assert (summary.rows, summary.groups, summary.informative_groups) == (6, 3, 3)
+    assert (summary.trained_sequences, summary.missing_trajectories) == (3, 1)
+    assert summary.loss > 0
+    assert fake.loads == [
+        ("http://policy:8000", "adapter-ptr1-1", "/adapters/adapter-ptr1-1")
+    ]
+    assert fake.metrics[0][1]["method"] == "sft"
+
+
+def test_sft_fails_when_no_rollout_reaches_the_threshold(
+    tmp_path: Path,
+    tiny_tokenizer: Any,
+    make_trajectory: Callable[[str], dict[str, Any]],
+) -> None:
+    fake = FakeIO(tiny_tokenizer, _trajectories(make_trajectory), tmp_path / "ckpt")
+    raw = _raw_config(tmp_path / "adapters", 0)
+    raw["method"] = "sft"
+    raw["sft_min_reward"] = 5.0
+
+    with pytest.raises(
+        RuntimeError, match="no rollout reached the SFT reward threshold"
+    ):
+        run_iteration(TrainerConfig.from_mapping(raw), None, fake.io())
+    assert fake.loads == []
+
+
+def test_config_rejects_an_unknown_method(tmp_path: Path) -> None:
+    raw = _raw_config(tmp_path, 0)
+    raw["method"] = "dpo"
+
+    with pytest.raises(TrainerConfigError, match="method"):
+        TrainerConfig.from_mapping(raw)

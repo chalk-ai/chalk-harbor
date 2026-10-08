@@ -9,6 +9,8 @@ from chalk_harbor.post_training.config import (
     TrainerConfigError,
 )
 from chalk_harbor.post_training.rewards import (
+    ScoredRow,
+    best_rollouts,
     extract_score,
     group_advantages,
     group_stats,
@@ -170,3 +172,24 @@ def test_config_takes_an_empty_adapter_in_at_the_first_iteration() -> None:
     config = TrainerConfig.from_mapping({**_contract(), "adapter_in": ""})
 
     assert config.adapter_in == ""
+
+
+def test_best_rollouts_keeps_each_groups_best_or_those_above_a_threshold() -> None:
+    rows = [
+        ScoredRow(group_key=("a",), reward=0.2, output="a0", source="r0#0"),
+        ScoredRow(group_key=("a",), reward=0.9, output="a1", source="r1#0"),
+        ScoredRow(group_key=("b",), reward=0.4, output="b0", source="r0#1"),
+        ScoredRow(group_key=("b",), reward=0.4, output="b1", source="r1#1"),
+    ]
+
+    # Without a threshold every group contributes its best rollouts, ties included.
+    best = best_rollouts(rows, None)
+    assert [(s.row.output, s.advantage) for s in best] == [
+        ("a1", 1.0),
+        ("b0", 1.0),
+        ("b1", 1.0),
+    ]
+    # With one, only rollouts at or above it, whatever their group.
+    assert [s.row.output for s in best_rollouts(rows, 0.4)] == ["a1", "b0", "b1"]
+    assert [s.row.output for s in best_rollouts(rows, 0.5)] == ["a1"]
+    assert best_rollouts(rows, 2.0) == []

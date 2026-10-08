@@ -30,8 +30,17 @@ class ScorerColumn:
     field: str
 
 
+# How the trainer learns from an iteration's rollouts.
+METHODS = ("grpo", "sft")
+
 # Trainer knobs that are not part of the workflow contract, and their values when absent.
 OPTIONAL_KEYS: dict[str, Any] = {
+    # "grpo": one policy-gradient step weighted by each rollout's group advantage. "sft":
+    # cross-entropy on the rollouts chosen by `sft_min_reward` (rejection sampling).
+    "method": "grpo",
+    # SFT keeps every rollout whose weighted reward is at least this; None keeps each
+    # row's best-scoring rollouts instead, since reward scales differ per evaluation.
+    "sft_min_reward": None,
     # LoRA scale is alpha / rank.
     "lora_alpha": None,  # None: twice the rank
     "max_seq_len": 32768,
@@ -84,6 +93,8 @@ class TrainerConfig:
     trajectory_file: str
     load_timeout_seconds: float
     torch_dtype: str
+    method: str
+    sft_min_reward: float | None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> TrainerConfig:
@@ -103,6 +114,12 @@ class TrainerConfig:
         }
         lora_rank = _int(_required(raw, "lora_rank"), "lora_rank")
         lora_alpha = _optional(raw, "lora_alpha")
+        method = str(_optional(raw, "method"))
+        if method not in METHODS:
+            raise TrainerConfigError(
+                f"'method' must be one of {METHODS}, got {method!r}"
+            )
+        sft_min_reward = _optional(raw, "sft_min_reward")
         return cls(
             post_training_id=_str(raw, "post_training_id"),
             iteration=_int(_required(raw, "iteration"), "iteration"),
@@ -137,6 +154,10 @@ class TrainerConfig:
                 _optional(raw, "load_timeout_seconds"), "load_timeout_seconds"
             ),
             torch_dtype=str(_optional(raw, "torch_dtype")),
+            method=method,
+            sft_min_reward=None
+            if sft_min_reward is None
+            else _float(sft_min_reward, "sft_min_reward"),
         )
 
 

@@ -142,6 +142,30 @@ def group_advantages(rows: Sequence[ScoredRow]) -> list[Sample]:
     return samples
 
 
+def best_rollouts(rows: Sequence[ScoredRow], min_reward: float | None) -> list[Sample]:
+    """Rejection sampling for SFT: the rollouts worth imitating, each with advantage 1.
+
+    With ``min_reward`` set, every rollout scoring at least that much is kept. Without it,
+    each group keeps its best-scoring rollouts (all of them when tied), which needs no
+    knowledge of the reward's scale. An advantage of 1 makes the policy-gradient loss the
+    plain mean negative log-likelihood of the kept tokens, so the GRPO step trains SFT.
+    """
+    if min_reward is not None:
+        return [Sample(row=r, advantage=1.0) for r in rows if r.reward >= min_reward]
+    groups: dict[tuple[str, ...], list[ScoredRow]] = {}
+    for row in rows:
+        groups.setdefault(row.group_key, []).append(row)
+    samples: list[Sample] = []
+    for members in groups.values():
+        best = max(r.reward for r in members)
+        samples.extend(
+            Sample(row=r, advantage=1.0)
+            for r in members
+            if best - r.reward <= ZERO_VARIANCE_EPSILON
+        )
+    return samples
+
+
 def group_stats(
     rows: Sequence[ScoredRow], samples: Sequence[Sample], skipped: int
 ) -> GroupStats:
