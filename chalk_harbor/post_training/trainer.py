@@ -191,7 +191,7 @@ def run_iteration(config: TrainerConfig, df: Any, io: TrainerIO) -> IterationSum
         f"{config.policy_adapter_dir.rstrip('/')}/{config.adapter_out}",
         config.load_timeout_seconds,
     )
-    _log(f"policy server loaded {config.adapter_out}")
+    _log(f"policy server serves {config.adapter_out}")
     return summary
 
 
@@ -513,45 +513,94 @@ def commit_mount(path: str) -> None:
 def load_lora_adapter(
     server_url: str, name: str, path: str, timeout_seconds: float
 ) -> None:
-    """Ask a vLLM server to load (or reload) a LoRA adapter, retrying until it can.
+    """Make a vLLM policy server serve a LoRA adapter, on every replica, before returning.
 
-    vLLM answers 400/404 while the adapter's files are not yet visible in its own mount of
-    the adapter volume (which reloads on an interval), and 5xx or a refused connection while
-    it restarts, so those retry until ``timeout_seconds``. The bearer key, when vLLM was
-    started with one, comes from ``POLICY_SERVER_API_KEY``.
+    A server started with vLLM's filesystem LoRA resolver over the adapter volume loads
+    ``name`` from its own mount on the first request that names it, so any number of replicas
+    serve a new adapter once their mounts (which reload on an interval) show its files. One
+    without the resolver serves only what ``/v1/load_lora_adapter`` loaded, so that is asked
+    first: it makes a single-replica server ready, and on a resolver server it just loads one
+    replica early. Then requests naming the adapter must succeed ``_SERVE_PROBE_STREAK`` times
+    in a row; the load balancer spreads them, so a replica whose mount still lags answers 404
+    and resets the streak until it catches up.
+
+    The bearer key, when vLLM was started with one, comes from ``POLICY_SERVER_API_KEY``.
     """
-    body = json.dumps(
-        {"lora_name": name, "lora_path": path, "load_inplace": True}
-    ).encode()
+    deadline = time.monotonic() + timeout_seconds
+    _post_until_ok(
+        f"{server_url.rstrip('/')}/v1/load_lora_adapter",
+        {"lora_name": name, "lora_path": path, "load_inplace": True},
+        what=f"load {name} from {path}",
+        deadline=deadline,
+    )
+    streak = 0
+    delay = 2.0
+    while streak < _SERVE_PROBE_STREAK:
+        status, detail = _post_json(
+            f"{server_url.rstrip('/')}/v1/chat/completions",
+            {
+                "model": name,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            timeout=120,
+        )
+        if status == 200:
+            streak += 1
+            continue
+        if status in (401, 403):
+            raise RuntimeError(f"policy server refused the key: {detail}")
+        streak = 0
+        if time.monotonic() + delay > deadline:
+            raise RuntimeError(f"policy server does not serve {name}: {detail}")
+        _log(f"{name} not served everywhere yet ({detail}); retrying in {delay:.0f}s")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 15.0)
+    _log(f"{name} answered {_SERVE_PROBE_STREAK} requests in a row")
+
+
+# Consecutive successful requests naming a new adapter that count as every replica serving
+# it. Requests are spread over the replicas, so this should exceed the replica count.
+_SERVE_PROBE_STREAK = 8
+
+
+def _post_json(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, str]:
+    """POST JSON; the HTTP status (0 when the server is unreachable) and a short detail."""
     headers = {"Content-Type": "application/json"}
     api_key = os.environ.get("POLICY_SERVER_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    deadline = time.monotonic() + timeout_seconds
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read()[:500].decode(errors="replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, f"HTTP {exc.code}: {exc.read()[:500].decode(errors='replace')}"
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        return 0, f"{type(exc).__name__}: {exc}"
+
+
+def _post_until_ok(
+    url: str, payload: dict[str, Any], what: str, deadline: float
+) -> None:
+    """POST until 200, retrying while the server is restarting or its mount lags.
+
+    vLLM answers 400/404 while the adapter's files are not yet visible in its mount of the
+    adapter volume, and 5xx or a refused connection while it restarts.
+    """
     delay = 5.0
     while True:
-        request = urllib.request.Request(
-            f"{server_url.rstrip('/')}/v1/load_lora_adapter",
-            data=body,
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=300) as response:
-                _log(f"load_lora_adapter: {response.status} {response.read()[:500]!r}")
-                return
-        except urllib.error.HTTPError as exc:
-            detail = exc.read()[:500].decode(errors="replace")
-            if exc.code in (401, 403):
-                raise RuntimeError(f"policy server refused the key: {detail}") from exc
-            error = f"HTTP {exc.code}: {detail}"
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-            error = f"{type(exc).__name__}: {exc}"
+        status, detail = _post_json(url, payload, timeout=300)
+        if status == 200:
+            _log(f"{what}: {detail}")
+            return
+        if status in (401, 403):
+            raise RuntimeError(f"policy server refused the key: {detail}")
         if time.monotonic() + delay > deadline:
-            raise RuntimeError(
-                f"policy server did not load {name} from {path}: {error}"
-            )
-        _log(f"load_lora_adapter not done ({error}); retrying in {delay:.0f}s")
+            raise RuntimeError(f"policy server could not {what}: {detail}")
+        _log(f"could not {what} yet ({detail}); retrying in {delay:.0f}s")
         time.sleep(delay)
         delay = min(delay * 1.5, 30.0)
 

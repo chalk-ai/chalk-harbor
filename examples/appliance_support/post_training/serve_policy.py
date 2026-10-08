@@ -2,7 +2,7 @@
 #
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["chalkcompute>=2.13"]
+# dependencies = ["chalkcompute>=2.13.3"]
 # ///
 """Serve the post-training policy with vLLM, and route `<prefix>/<model>` to it.
 
@@ -12,17 +12,24 @@
 Run once per environment. It creates:
 
 1. the adapter volume (``--adapter-volume``) the training runs write LoRA adapters to;
-2. a scaling group running ``vllm/vllm-openai`` with the base model, LoRA serving enabled at
-   runtime (``VLLM_ALLOW_RUNTIME_LORA_UPDATING``, so ``/v1/load_lora_adapter`` works), the
-   hermes tool-call parser the Larkspur agent's function calling needs, and the adapter
-   volume mounted at ``/chalk/adapters``;
+2. a scaling group of ``--replicas`` servers running ``vllm/vllm-openai`` with the base model,
+   the hermes tool-call parser the Larkspur agent's function calling needs, and the adapter
+   volume mounted at ``/chalk/adapters``. vLLM's filesystem LoRA resolver points at that mount,
+   so every replica loads ``adapter-<id>-<k>`` from it the first time a request names it;
+   ``/v1/load_lora_adapter`` also works (``VLLM_ALLOW_RUNTIME_LORA_UPDATING``);
 3. a Model Gateway provider connection of kind ``vllm`` with prefix ``--prefix``, so the
    evaluation's task reaches the policy through Chalk's AI router as
    ``<prefix>/Qwen/Qwen3-4B-Instruct-2507`` and, once trained, ``<prefix>/adapter-<id>-<k>``.
 
-The volume mount in the server sees new commits only after a reload, so the server's
-entrypoint reloads it every 15 s in the background; the trainer retries
-``/v1/load_lora_adapter`` until its adapter is visible.
+The volume mount in each replica sees new commits only after a reload, so the entrypoint
+reloads it every 15 s in the background; the trainer retries until requests naming its adapter
+succeed repeatedly, i.e. until every replica's mount shows it.
+
+``--host`` runs on host-class GPUs (a hypervisor host pool, e.g. external A100s): it adds
+Chalk workload identity (volume mounts there need it), Hugging Face egress, loopback gloo
+(the host's hostname is longer than ``HOST_NAME_MAX``), the driver's libcuda for triton, and
+eager mode unless ``--cuda-graphs``, which captures CUDA graphs without torch.compile (compile
+adds minutes of startup under gVisor for no throughput gain there).
 
 Prints the policy server URL to give StartEvaluationPostTraining as ``policy_server_url``.
 
@@ -59,7 +66,7 @@ def vllm_command(args: argparse.Namespace) -> list[str]:
         "--port", str(PORT), "--dtype", "bfloat16",
         "--max-model-len", str(args.max_model_len),
         "--gpu-memory-utilization", "0.90",
-        "--enable-lora", "--max-lora-rank", str(args.max_lora_rank),
+        *((["--compilation-config", '{"level": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}'] if args.cuda_graphs else ["--enforce-eager"]) if args.host else []), "--enable-lora", "--max-lora-rank", str(args.max_lora_rank),
         "--max-loras", str(args.max_loras),
         "--enable-auto-tool-choice", "--tool-call-parser", "hermes",
     ]  # fmt: skip
@@ -75,30 +82,67 @@ def vllm_command(args: argparse.Namespace) -> list[str]:
     return ["bash", "-c", script]
 
 
+def _allow_hf_egress(hosts: list[str]) -> None:
+    """ScalingGroup takes no network_policy; host containers get no egress without one."""
+    import chalkcompute._scaling_group as sgmod
+    from chalkcompute import NetworkPolicy
+
+    base = sgmod.ContainerSpec
+
+    class _Spec(base):  # type: ignore[misc,valid-type]
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            kw.setdefault("network_policy", NetworkPolicy(allowed_hosts=hosts))
+            super().__init__(*a, **kw)
+
+    sgmod.ContainerSpec = _Spec  # type: ignore[assignment]
+
+
 def scaling_group(args: argparse.Namespace) -> Any:
-    from chalkcompute import ReadinessProbe, ScalingGroup, Secret
+    from chalkcompute import ComputeClass, ReadinessProbe, ScalingGroup, Secret
 
     env: dict[str, Any] = {
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+        # Every replica loads an adapter from its own mount of the adapter volume the first time a
+        # request names it, so new adapters need no per-replica /v1/load_lora_adapter call.
+        "VLLM_PLUGINS": "lora_filesystem_resolver",
+        "VLLM_LORA_RESOLVER_CACHE_DIR": ADAPTER_MOUNT,
+        **(
+            {
+                # Host containers have a hostname longer than HOST_NAME_MAX, which breaks
+                # gloo's hostname lookup; and triton misses the injected libcuda.
+                "GLOO_SOCKET_IFNAME": "lo",
+                "VLLM_HOST_IP": "127.0.0.1",
+                "TRITON_LIBCUDA_PATH": "/usr/lib/x86_64-linux-gnu",
+            }
+            if args.host
+            else {}
+        ),
         "HF_HOME": "/tmp/hf",
+        # GKE mounts the driver libraries under /usr/local/nvidia; the vLLM image's own
+        # LD_LIBRARY_PATH omits them, so vLLM would find no GPU there.
+        "LD_LIBRARY_PATH": "/usr/local/nvidia/lib64:/usr/local/cuda/lib64",
     }
     if args.api_key_env:
         env["VLLM_API_KEY"] = Secret.from_local_env(args.api_key_env)
+    if args.host:
+        _allow_hf_egress(["huggingface.co", "*.huggingface.co", "hf.co", "*.hf.co"])
     return ScalingGroup(
         image=args.vllm_image,
         name=args.name,
         gpu=args.gpu,
         cpu="8",
-        memory="48Gi",
+        memory=args.memory,
         port=PORT,
         env=env,
         volumes=[(args.adapter_volume, ADAPTER_MOUNT)],
         entrypoint=vllm_command(args),
         readiness_probe=ReadinessProbe.http("/health"),
-        # /v1/load_lora_adapter loads into whichever replica answers it, so a second replica
-        # would serve requests for adapters it never loaded.
-        min_replicas=1,
-        max_replicas=1,
+        # The filesystem LoRA resolver makes any replica serve an adapter from the volume.
+        min_replicas=args.replicas,
+        max_replicas=args.replicas,
+        compute_class=ComputeClass.HOST if args.host else None,
+        # An external host mounts versioned volumes with the container's own Chalk identity.
+        chalk_identity=args.host,
     )
 
 
@@ -110,7 +154,8 @@ def provider_connection_request(
         "name": args.connection_name,
         "providerKind": "vllm",
         "baseUrl": f"{server_url.rstrip('/')}/v1",
-        "prefix": args.prefix,
+        # The router stores a prefix as one segment with its trailing slash.
+        "prefix": f"{args.prefix.rstrip('/')}/",
         "exposure": "EXPOSURE_POLICY_DYNAMIC",
         "routingEnabled": True,
     }
@@ -170,6 +215,18 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--prefix", default="posttrain")
     parser.add_argument("--connection-name", default="larkspur-policy")
     parser.add_argument("--api-key-env", default=None)
+    parser.add_argument(
+        "--host", action="store_true", help="run on a host-class (hypervisor) GPU host"
+    )
+    parser.add_argument("--memory", default="48Gi")
+    parser.add_argument(
+        "--replicas", type=int, default=1, help="each replica takes one --gpu"
+    )
+    parser.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        help="host class: CUDA graphs without torch.compile",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
