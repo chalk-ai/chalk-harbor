@@ -174,9 +174,13 @@ class FraudAnalystAgent(BaseAgent):
         nudges = 0
         try:
             for _ in range(MAX_STEPS):
+                # Exact timing in the ATIF ``extra`` fields lets chalk_harbor.tracing give the
+                # model call and each tool call its own span within the turn.
+                llm_started = _now()
                 response = await self._complete(
                     model=self.model_name, messages=messages, tools=TOOLS
                 )
+                llm_finished = _now()
                 reply = response.choices[0].message
                 self._count(response)
                 calls = reply.tool_calls or []
@@ -185,11 +189,12 @@ class FraudAnalystAgent(BaseAgent):
                         exclude_none=True, exclude={"audio", "refusal", "annotations"}
                     )
                 )
-                step = Step(step_id=len(self._steps) + 1, timestamp=_now(), source="agent", model_name=self.model_name,
+                step = Step(step_id=len(self._steps) + 1, timestamp=llm_finished, source="agent", model_name=self.model_name,
                             message=reply.content or "",
                             tool_calls=[ToolCall(tool_call_id=c.id, function_name=c.function.name,
                                                  arguments=_parse_json(c.function.arguments)) for c in calls] or None,
-                            metrics=self._metrics(response))  # fmt: skip
+                            metrics=self._metrics(response),
+                            extra={"llm_started_at": llm_started, "llm_finished_at": llm_finished})  # fmt: skip
                 self._steps.append(step)
                 if not calls:
                     nudges += 1
@@ -208,16 +213,25 @@ class FraudAnalystAgent(BaseAgent):
                     continue
                 results = []
                 for call in calls:
+                    tool_started = _now()
                     output = await self._run_tool(
                         environment,
                         call.function.name,
                         _parse_json(call.function.arguments),
                     )
+                    tool_finished = _now()
                     messages.append(
                         {"role": "tool", "tool_call_id": call.id, "content": output}
                     )
                     results.append(
-                        ObservationResult(source_call_id=call.id, content=output)
+                        ObservationResult(
+                            source_call_id=call.id,
+                            content=output,
+                            extra={
+                                "started_at": tool_started,
+                                "finished_at": tool_finished,
+                            },
+                        )
                     )
                 step.observation = Observation(results=results)
                 self._write()
