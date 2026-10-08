@@ -10,7 +10,16 @@ dependencies = [
     "chalkcompute>=2.13",
     "dockerfile-parse>=2.0",
     "harbor>=0.23",
+    "opentelemetry-api>=1.20",
 ]
+
+[project.optional-dependencies]
+# The evaluation post-training trainer (chalk_harbor.post_training). The trainer image
+# installs a CUDA build of torch; locally, uv resolves the CPU build below.
+post-training = ["peft>=0.15", "torch>=2.6", "transformers>=4.56"]
+
+[dependency-groups]
+dev = ["opentelemetry-sdk>=1.20", "pytest>=8"]
 
 [project.urls]
 Homepage = "https://github.com/chalk-ai/chalk-harbor"
@@ -21,3 +30,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["chalk_harbor"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

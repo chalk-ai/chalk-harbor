@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import io
 import ipaddress
 import json
@@ -62,6 +63,8 @@ from harbor.environments.tar_transfer import (
 )
 from harbor.models.task.config import EnvironmentConfig, NetworkMode
 from harbor.models.trial.paths import TrialPaths
+
+from chalk_harbor.evaluation import sandbox_tags
 
 # Largest compressed context one COPY may embed. Build steps travel inside the image spec,
 # so an unbounded payload would turn a stray COPY of a dataset into an opaque RPC failure.
@@ -192,7 +195,8 @@ class ChalkSandboxEnvironment(BaseEnvironment):
             volumes=self._volumes or None,
             network_policy=self._sandbox_network_policy(),
             lifetime=self._lifetime,
-            tags={"harbor.session": _label_value(self.session_id)},
+            # Inside a Chalk evaluation, the evaluation, run and row the trial belongs to.
+            tags={"harbor.session": _label_value(self.session_id), **sandbox_tags()},
         )
         self.logger.debug(
             f"Chalk sandbox {self._sandbox.id} started for {self.session_id}"
@@ -411,12 +415,17 @@ def _embedded_copy(context: Path, value: str, dockerfile: Path) -> list[str]:
                 f"{dockerfile}: COPY source {source!r} escapes the build context"
             )
         buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        # The image service caches builds by their instructions, so the same files must
+        # always embed as the same bytes: no gzip timestamp, and normalized tar headers.
+        with (
+            gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as compressed,
+            tarfile.open(fileobj=compressed, mode="w") as tar,
+        ):
             if src.is_dir():
-                tar.add(src, arcname=".")
+                _add_reproducibly(tar, src, ".")
                 target_dir, rename = dest, None
             else:
-                tar.add(src, arcname=src.name)
+                _add_reproducibly(tar, src, src.name)
                 if into_dir:
                     target_dir, rename = dest, None
                 else:
@@ -437,6 +446,21 @@ def _embedded_copy(context: Path, value: str, dockerfile: Path) -> list[str]:
             script += f" && mv {shlex.quote(f'{target_dir}/{src.name}')} {shlex.quote(f'{target_dir}/{rename}')}"
         steps.append(f"RUN {script}")
     return steps
+
+
+def _add_reproducibly(tar: tarfile.TarFile, path: Path, arcname: str) -> None:
+    """``tar.add`` with entries in sorted order and no mtime, owner or group."""
+
+    def normalize(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        info.mtime = 0
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        return info
+
+    tar.add(path, arcname=arcname, recursive=False, filter=normalize)
+    if path.is_dir() and not path.is_symlink():
+        for child in sorted(path.iterdir()):
+            _add_reproducibly(tar, child, f"{arcname}/{child.name}")
 
 
 __all__ = ["ChalkSandboxEnvironment"]
