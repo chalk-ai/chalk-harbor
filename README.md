@@ -100,6 +100,8 @@ holds:
 | `output_column` | the task output column, whose JSON points at the trial (`volume_path`) |
 | `reward_weights` | scorer id to weight (negative for a scorer to minimize) |
 | `scorer_columns` | scorer id to `{column, field}`; defaults to `<scorer>_value` / `score` |
+| `method` | `grpo` (default) or `sft`, which trains on the rollouts the scorers rate best, each weighted 1, so the step is cross-entropy on them |
+| `sft_min_reward` | with `sft`, keep every rollout at or above this weighted reward; unset keeps each row's best |
 
 Optional trainer settings (`max_seq_len`, `logprob_chunk_size`, `trajectory_volume`, and more)
 are listed in `chalk_harbor/post_training/config.py`. The trainer reads each sample's ATIF

@@ -1,11 +1,13 @@
-"""One GRPO + LoRA iteration of evaluation post-training, as a Chalk training function.
+"""One LoRA iteration of evaluation post-training, as a Chalk training function.
 
 A post-training workflow runs the evaluation ``samples_per_row`` times with the current policy,
 then starts a training run whose entrypoint (``python -m chalkcompute.training.entrypoint``)
 calls ``train_policy(df, config)`` with the contract in ``config.TrainerConfig``. This:
 
-1. reads every rollout's result dataset revision and computes each row's weighted reward and
-   its Dr-GRPO advantage within its group (``rewards``);
+1. reads every rollout's result dataset revision and computes each row's weighted reward,
+   then picks what to train on (``rewards``): with ``method`` "grpo", every row of a group
+   with a reward spread, weighted by its Dr-GRPO advantage; with "sft", the best-scoring
+   rollouts, weighted 1, so the same step is a cross-entropy step on them;
 2. loads the trajectory each informative row's output points at and rebuilds the agent's chat
    (``trajectory``), then tokenizes it with the base model's chat template and masks it to
    the tokens the policy generated (``masking``);
@@ -38,6 +40,7 @@ from chalk_harbor.post_training.config import TrainerConfig
 from chalk_harbor.post_training.masking import TemplateMismatchError, tokenize_chat
 from chalk_harbor.post_training.rewards import (
     Sample,
+    best_rollouts,
     group_advantages,
     group_stats,
     score_rows,
@@ -125,14 +128,23 @@ def run_iteration(config: TrainerConfig, df: Any, io: TrainerIO) -> IterationSum
         weights=config.reward_weights,
         columns=config.scorer_columns,
     )
-    samples = group_advantages(scored)
+    if config.method == "sft":
+        samples = best_rollouts(scored, config.sft_min_reward)
+        selection = "kept for SFT"
+    else:
+        samples = group_advantages(scored)
+        selection = "with a reward spread"
     stats = group_stats(scored, samples, skipped)
     _log(
-        f"{stats.rows} scored rows ({stats.skipped_rows} skipped) in {stats.groups} groups, "
-        + f"{stats.informative_groups} with a reward spread; mean reward "
+        f"{config.method}: {stats.rows} scored rows ({stats.skipped_rows} skipped) in "
+        + f"{stats.groups} groups, {stats.informative_groups} {selection}; mean reward "
         + f"{stats.mean_reward:.4f} (std {stats.reward_std:.4f})"
     )
     if not samples:
+        if config.method == "sft":
+            raise RuntimeError(
+                f"no rollout reached the SFT reward threshold {config.sft_min_reward}"
+            )
         raise RuntimeError(
             "no group has a reward spread to learn from; every rollout of each dataset row "
             + "scored the same"
@@ -390,6 +402,7 @@ def _report(
     tags = {
         "post_training_id": config.post_training_id,
         "iteration": str(config.iteration),
+        "method": config.method,
     }
     metrics = {
         "reward": summary.mean_reward,
