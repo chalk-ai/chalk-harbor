@@ -14,19 +14,25 @@ Span tree::
     ├── harbor.environment_setup      CHAIN
     ├── harbor.agent_setup            CHAIN
     ├── harbor.agent_execution        CHAIN
-    │   ├── <model>                   LLM    one per agent turn: message, tokens, cost
-    │   └── <tool name>               TOOL   one per tool call: arguments in, observation out
+    │   └── turn <n>                  CHAIN  one per agent step: its model call, then its tools
+    │       ├── <model>               LLM    message, tokens, cost
+    │       └── <tool name>           TOOL   one per tool call: arguments in, observation out
     └── harbor.verifier               CHAIN  rewards
 
-A turn's LLM span runs from the previous step to the turn's own timestamp (the time the
-model took to produce it); its tool spans run from that timestamp to the next step's (the
-time the tools took before the agent continued). ATIF records no finer timing than that.
+Timing. ATIF stamps each step once, and agents disagree on what the stamp means: terminus-2
+records a step after running its tools, an agent that writes the step as soon as the model
+replies records it before. So the step stamp alone cannot split a turn into its model call
+and its tool calls. Where the trajectory says (``_LLM_STARTED``/``_LLM_FINISHED`` in a step's
+``extra``, ``_STARTED``/``_FINISHED`` in a tool call's or its observation's ``extra``), each
+span gets its true interval and the turn spans them. Otherwise the turn runs from the previous
+step's stamp to its own, terminus-2's meaning, and its model and tool spans share that
+interval, marked ``harbor.timing = "step"``. Either way consecutive turns do not overlap.
 
 ``emit_trial_spans`` replays a finished trial. ``stream_trial_spans`` wraps a running one:
-Harbor rewrites the trajectory after every step, so each turn's LLM span is exported as soon
-as the turn is recorded and its tool spans as soon as the next step starts, while the
-enclosing spans end, and therefore arrive, when the trial does. A trace viewer that hangs
-spans with a missing parent under a synthetic root can show the agent's progress live.
+Harbor rewrites the trajectory after every step, so each turn is exported as soon as it is
+complete (its tool results are recorded, or a later step exists), while the enclosing spans
+end, and therefore arrive, when the trial does. A trace viewer that hangs spans with a
+missing parent under a synthetic root can show the agent's progress live.
 
 Inside a Chalk evaluation, every span also carries the evaluation and run it belongs to
 (``evaluation_attributes``), so a run's trials can be found while the run is still going.
@@ -34,6 +40,7 @@ Inside a Chalk evaluation, every span also carries the evaluation and run it bel
 
 from __future__ import annotations
 
+import contextvars
 import json
 import threading
 import time
@@ -53,6 +60,9 @@ _TRACER_NAME = "chalk_harbor"
 # Attribute values are capped so one huge observation cannot blow the span size limit.
 _MAX_VALUE_CHARS = 16_000
 _SETUP_PHASES = ("environment_setup", "agent_setup")
+# Optional exact timing an agent can record in ATIF ``extra`` fields (ISO 8601 timestamps).
+_LLM_STARTED, _LLM_FINISHED = "llm_started_at", "llm_finished_at"
+_STARTED, _FINISHED = "started_at", "finished_at"
 # The span attribute each part of the evaluation context is recorded as. The session needs
 # none: chalkcompute stamps every span in a row's session with it already.
 _EVALUATION_ATTRIBUTES = {
@@ -92,7 +102,7 @@ def emit_trial_spans(
         evaluation_attributes() if attributes is None else dict(attributes),
     )
     root = emitter.start_root(_ns(result.get("started_at")), instruction)
-    emitter.finish(root, result, trajectory, emitted_steps=0, execution=None)
+    emitter.finish(root, result, trajectory, emitted_turns=set(), execution=None)
 
 
 @contextmanager
@@ -150,19 +160,49 @@ class _Emitter:
         _set(execution, {"openinference.span.kind": "CHAIN"})
         return execution
 
-    def emit_llm_span(
+    def emit_turn(
         self,
         execution: Span,
         trajectory: dict[str, Any],
-        times: list[int | None],
         index: int,
+        turn_number: int,
+        previous_time: int | None,
     ) -> None:
+        """Emit the turn of agent step ``index``: its model call, then its tool calls."""
         step = trajectory["steps"][index]
+        step_time = _ns(step.get("timestamp"))
+        step_extra = step.get("extra") or {}
+        llm_start = _ns(step_extra.get(_LLM_STARTED))
+        llm_end = _ns(step_extra.get(_LLM_FINISHED))
+        exact = llm_start is not None and llm_end is not None
+        if not exact:
+            llm_start, llm_end = previous_time or step_time, step_time
+        timing = {} if exact else {"harbor.timing": "step"}
+
+        observations = {
+            result.get("source_call_id"): result
+            for result in ((step.get("observation") or {}).get("results") or [])
+        }
+        tools = []
+        for call in step.get("tool_calls") or []:
+            observation = observations.get(call.get("tool_call_id")) or {}
+            recorded = {**(observation.get("extra") or {}), **(call.get("extra") or {})}
+            start, end = _ns(recorded.get(_STARTED)), _ns(recorded.get(_FINISHED))
+            if start is None or end is None:
+                # No tool timing: in exact mode the tool ran after the model replied, so it
+                # is placed there; otherwise it shares the turn's step interval.
+                start, end = (llm_end, llm_end) if exact else (llm_start, llm_end)
+            tools.append((call, observation, start, end))
+
+        starts = [t for t in [llm_start, *(t[2] for t in tools)] if t is not None]
+        ends = [t for t in [llm_end, *(t[3] for t in tools)] if t is not None]
+        turn = self.span(f"turn {turn_number}", execution, min(starts, default=None))
+        _set(turn, {"openinference.span.kind": "CHAIN", "harbor.turn": turn_number})
+
         agent = trajectory.get("agent") or {}
-        previous = next((t for t in reversed(times[:index]) if t), times[index])
         metrics = step.get("metrics") or {}
         model = step.get("model_name") or agent.get("model_name") or "llm"
-        llm = self.span(model, execution, previous)
+        llm = self.span(model, turn, llm_start)
         _set(
             llm,
             {
@@ -180,23 +220,13 @@ class _Emitter:
                 "llm.cost.total": metrics.get("cost_usd"),
                 "output.value": step.get("message") or None,
                 "harbor.reasoning": step.get("reasoning_content"),
+                **timing,
             },
         )
-        llm.end(end_time=times[index] or previous)
+        llm.end(end_time=llm_end)
 
-    def emit_tool_spans(
-        self,
-        execution: Span,
-        step: dict[str, Any],
-        start_time: int | None,
-        end_time: int | None,
-    ) -> None:
-        observations = {
-            result.get("source_call_id"): result.get("content")
-            for result in ((step.get("observation") or {}).get("results") or [])
-        }
-        for call in step.get("tool_calls") or []:
-            tool = self.span(call.get("function_name") or "tool", execution, start_time)
+        for call, observation, start, end in tools:
+            tool = self.span(call.get("function_name") or "tool", turn, start)
             _set(
                 tool,
                 {
@@ -205,10 +235,12 @@ class _Emitter:
                     "tool_call.id": call.get("tool_call_id"),
                     "input.value": json.dumps(call.get("arguments"), default=str),
                     "input.mime_type": "application/json",
-                    "output.value": _text(observations.get(call.get("tool_call_id"))),
+                    "output.value": _text(observation.get("content")),
+                    **timing,
                 },
             )
-            tool.end(end_time=end_time)
+            tool.end(end_time=end)
+        turn.end(end_time=max(ends, default=None))
 
     def finish(
         self,
@@ -216,14 +248,13 @@ class _Emitter:
         result: dict[str, Any] | None,
         trajectory: dict[str, Any] | None,
         *,
-        emitted_steps: int,
+        emitted_turns: set[int],
         execution: Span | None,
     ) -> None:
         """Emit everything not yet emitted from the final record, then end every open span.
 
-        Steps before ``emitted_steps`` already have their LLM span, and all but the last of
-        them their tool spans. A streamed trial passes its open ``execution`` span; a
-        replayed one passes None.
+        ``emitted_turns`` are the step indices whose turns are already emitted. A streamed
+        trial passes its open ``execution`` span; a replayed one passes None.
         """
         result = result or {}
         rewards = (result.get("verifier_result") or {}).get("rewards") or {}
@@ -250,18 +281,9 @@ class _Emitter:
         if execution is None and (block.get("started_at") or trajectory is not None):
             execution = self.start_execution(root, _ns(block.get("started_at")))
         if execution is not None:
-            steps = (trajectory or {}).get("steps") or []
-            times = [_ns(step.get("timestamp")) for step in steps]
-            for index in range(len(steps)):
-                if steps[index].get("source") != "agent":
-                    continue
-                if index >= emitted_steps:
-                    self.emit_llm_span(execution, trajectory, times, index)
-                if index + 1 >= emitted_steps:
-                    following = next((t for t in times[index + 1 :] if t), end)
-                    self.emit_tool_spans(
-                        execution, steps[index], times[index], following
-                    )
+            for index, number, previous in _agent_turns(trajectory, None):
+                if index not in emitted_turns:
+                    self.emit_turn(execution, trajectory, index, number, previous)
             execution.end(end_time=end)
 
         self._emit_phase(
@@ -289,8 +311,8 @@ class _Emitter:
 class _TrialStreamer:
     """Tails a running trial's trajectory and emits each step's spans as it is recorded.
 
-    The trial and agent-execution spans stay open until ``finish``; every LLM and tool span
-    under them ends, and so is exported, as soon as its timing is known.
+    The trial and agent-execution spans stay open until ``finish``; each turn under them
+    ends, and so is exported, as soon as it is complete.
     """
 
     def __init__(
@@ -306,13 +328,20 @@ class _TrialStreamer:
         self._emitter = _Emitter(otel_context.get_current(), attributes)
         self._root = self._emitter.start_root(time.time_ns(), instruction)
         self._execution: Span | None = None
-        # Steps whose LLM span is emitted; the tool spans of every step but the last of
-        # these are emitted too, since each needs the following step's start as its end.
-        self._emitted_steps = 0
+        # Step indices whose turns are emitted.
+        self._emitted_turns: set[int] = set()
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # Span processors read the context current where a span starts, not the span's parent:
+        # chalkcompute stamps each span with the row's session from the OTel baggage it finds
+        # there. A new thread starts with an empty context, so the poller runs in a copy of the
+        # caller's, or every span it emits lands outside the row's session.
+        context = contextvars.copy_context()
         self._thread = threading.Thread(
-            target=self._run, name="harbor-trial-spans", daemon=True
+            target=context.run,
+            args=(self._run,),
+            name="harbor-trial-spans",
+            daemon=True,
         )
 
     def start(self) -> None:
@@ -332,7 +361,7 @@ class _TrialStreamer:
                     self._root,
                     result,
                     trajectory,
-                    emitted_steps=self._emitted_steps,
+                    emitted_turns=self._emitted_turns,
                     execution=self._execution,
                 )
             except Exception:  # noqa: BLE001 - tracing must never fail the trial it describes
@@ -359,25 +388,50 @@ class _TrialStreamer:
         steps = (trajectory or {}).get("steps") or []
         if not steps:
             return
-        times = [_ns(step.get("timestamp")) for step in steps]
         with self._lock:
             if self._execution is None:
                 # The first step is the instruction handed to the agent, so it marks the
                 # start of agent execution as closely as anything recorded mid-trial.
-                self._execution = self._emitter.start_execution(self._root, times[0])
-            for index in range(self._emitted_steps, len(steps)):
-                if index > 0 and steps[index - 1].get("source") == "agent":
-                    self._emitter.emit_tool_spans(
-                        self._execution,
-                        steps[index - 1],
-                        times[index - 1],
-                        times[index],
-                    )
-                if steps[index].get("source") == "agent":
-                    self._emitter.emit_llm_span(
-                        self._execution, trajectory, times, index
-                    )
-            self._emitted_steps = len(steps)
+                self._execution = self._emitter.start_execution(
+                    self._root, _ns(steps[0].get("timestamp"))
+                )
+            for index, number, previous in _agent_turns(trajectory, None):
+                if index in self._emitted_turns or not _turn_complete(steps, index):
+                    continue
+                self._emitter.emit_turn(
+                    self._execution, trajectory, index, number, previous
+                )
+                self._emitted_turns.add(index)
+
+
+def _agent_turns(
+    trajectory: dict[str, Any] | None, start_time: int | None
+) -> Iterator[tuple[int, int, int | None]]:
+    """Each agent step's index, its turn number, and the stamp of the step before it."""
+    previous = start_time
+    number = 0
+    for index, step in enumerate((trajectory or {}).get("steps") or []):
+        if step.get("source") == "agent":
+            number += 1
+            yield index, number, previous
+        previous = _ns(step.get("timestamp")) or previous
+
+
+def _turn_complete(steps: list[dict[str, Any]], index: int) -> bool:
+    """Whether agent step ``index`` has every tool result it will get.
+
+    An agent that records the step before running its tools rewrites it with the results
+    afterwards; a later step means the agent has moved on either way.
+    """
+    if index + 1 < len(steps):
+        return True
+    step = steps[index]
+    calls = {call.get("tool_call_id") for call in step.get("tool_calls") or []}
+    results = {
+        result.get("source_call_id")
+        for result in ((step.get("observation") or {}).get("results") or [])
+    }
+    return calls <= results
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
