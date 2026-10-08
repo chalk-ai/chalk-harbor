@@ -54,8 +54,17 @@ is current:
 
 - a `harbor.trial` span (AGENT) for the whole trial, with the instruction, final message and
   reward, and one child per phase: environment setup, agent setup, agent execution, verifier;
-- an LLM span per agent turn, with model, token counts and cost;
+- a `turn <n>` span per agent step under agent execution, holding that step's model call and
+  then its tool calls;
+- an LLM span per model call, with model, token counts and cost;
 - a TOOL span per tool call, with its arguments and observation.
+
+ATIF stamps each step once, which cannot split a turn into its model call and its tool calls.
+An agent that records exact timing gets exact spans: put `llm_started_at` and
+`llm_finished_at` in the step's `extra`, and `started_at` and `finished_at` in each tool call's
+(or its observation's) `extra`, as ISO 8601 timestamps. Without them a turn runs from the
+previous step's stamp to its own, and its spans share that interval
+(`harbor.timing = "step"`).
 
 **Live, while the trial runs.** Wrap the `harbor run` in `stream_trial_spans`, pointed at the
 job directory it writes. Harbor rewrites `agent/trajectory.json` after every step, so each
