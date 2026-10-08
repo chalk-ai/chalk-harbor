@@ -290,7 +290,12 @@ class LarkspurSupportAgent(BaseAgent):
             base_url=os.environ.get("OPENAI_BASE_URL"),
             api_key=os.environ.get("OPENAI_API_KEY"),
             default_headers=headers or None,
-            timeout=180,
+            # A healthy call through the router takes seconds (p99 ~3.5 s at 40 concurrent), so
+            # one that runs a minute has stalled on a dropped connection. The SDK's own retries
+            # would stack three such waits before `_complete` saw a failure; `_complete` retries
+            # instead, so a stall costs one timeout rather than nine minutes of the trial.
+            timeout=60,
+            max_retries=0,
         )
         self._steps: list[Step] = []
         self._usage = {"prompt": 0, "completion": 0, "cached": 0}

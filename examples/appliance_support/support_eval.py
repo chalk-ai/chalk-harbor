@@ -161,7 +161,9 @@ def _router_env() -> dict[str, str]:
     max_replicas=4,
     cpu="16",
     memory="32Gi",
-    call_timeout=1500,
+    # A trial's p90 is ~10 min; a call that outlives that has stalled, and every run waits
+    # for its slowest call, so a long timeout makes one dead call the whole run's tail.
+    call_timeout=600,
 )
 def larkspur_support_trial(task_name: str, run_tag: str) -> str:
     import os
@@ -610,6 +612,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--only", nargs="*", default=None, help="Task names to run.")
     parser.add_argument(
+        "--no-run",
+        action="store_true",
+        help="Deploy and create the evaluation without running it (e.g. to post-train on it).",
+    )
+    parser.add_argument(
         "--rescore",
         metavar="RUN_ID",
         help="Score an earlier run's outputs with the current scorers.",
@@ -660,6 +667,9 @@ def main(argv: list[str]) -> int:
             "judge_model": JUDGE_MODEL,
         },
     )
+    if args.no_run:
+        print(f"tag {TAG}: evaluation {evaluation.id} (not run)", flush=True)
+        return 0
     started = time.time()
     run = evaluation.run()
     print(
