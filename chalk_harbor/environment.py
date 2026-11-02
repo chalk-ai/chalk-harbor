@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
+import hashlib
 import io
 import ipaddress
 import json
@@ -135,6 +137,7 @@ class ChalkSandboxEnvironment(BaseEnvironment):
             disable_internet=True,
             network_allowlist=True,
             network_allowlist_hostnames=True,
+            network_allowlist_wildcard_hostnames=True,
             network_allowlist_ipv4_addresses=True,
             network_allowlist_ipv4_cidrs=True,
         )
@@ -411,7 +414,9 @@ def _embedded_copy(context: Path, value: str, dockerfile: Path) -> list[str]:
                 f"{dockerfile}: COPY source {source!r} escapes the build context"
             )
         buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as compressed, tarfile.open(
+            fileobj=compressed, mode="w"
+        ) as tar:
             if src.is_dir():
                 tar.add(src, arcname=".")
                 target_dir, rename = dest, None
@@ -431,10 +436,21 @@ def _embedded_copy(context: Path, value: str, dockerfile: Path) -> list[str]:
                 f"{_EMBED_BUDGET_BYTES}-byte embed budget; mount it with --ek volumes=... instead"
             )
         encoded = base64.b64encode(payload).decode()
+        temp_file = f"/tmp/.harbor-copy-{hashlib.sha256(payload).hexdigest()}.b64"
+        for offset in range(0, len(encoded), 32 * 1024):
+            redirect = ">>" if offset else ">"
+            steps.append(
+                f"RUN printf %s '{encoded[offset : offset + 32 * 1024]}' {redirect} {temp_file}"
+            )
         unpack_dir = shlex.quote(target_dir)
-        script = f"mkdir -p {unpack_dir} && echo {encoded} | base64 -d | tar -xz -C {unpack_dir}"
+        script = f"mkdir -p {unpack_dir}"
         if rename is not None and rename != src.name:
-            script += f" && mv {shlex.quote(f'{target_dir}/{src.name}')} {shlex.quote(f'{target_dir}/{rename}')}"
+            script += ' && copy_dir=$(mktemp -d)'
+            unpack_dir = '"$copy_dir"'
+        script += f" && base64 -d {temp_file} | tar -xz -C {unpack_dir}"
+        if rename is not None and rename != src.name:
+            script += f' && mv "$copy_dir"/{shlex.quote(src.name)} {shlex.quote(f"{target_dir}/{rename}")} && rmdir "$copy_dir"'
+        script += f" && rm -f {temp_file}"
         steps.append(f"RUN {script}")
     return steps
 
