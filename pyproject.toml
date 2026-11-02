@@ -15,6 +15,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/chalk-ai/chalk-harbor"
 
+[dependency-groups]
+dev = ["pytest"]
+
 [build-system]
 requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
