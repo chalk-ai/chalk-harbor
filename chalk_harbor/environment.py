@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import gzip
+import hashlib
 import io
 import ipaddress
 import json
@@ -66,9 +67,9 @@ from harbor.models.trial.paths import TrialPaths
 
 from chalk_harbor.evaluation import sandbox_tags
 
-# Largest compressed context one COPY may embed. Build steps travel inside the image spec,
-# so an unbounded payload would turn a stray COPY of a dataset into an opaque RPC failure.
-_EMBED_BUDGET_BYTES = 4 * 1024 * 1024
+# Total translated instruction bytes, leaving headroom under the builder's roughly
+# 128 KiB whole-Dockerfile limit, which silently kills builds.
+_DOCKERFILE_INSTRUCTION_BUDGET_BYTES = 120 * 1024
 # Runs a Harbor command string under bash when the image has it: agent install scripts
 # use bash syntax, but minimal images (alpine, distroless-ish) only ship sh.
 # The image service discards everything written under /workspace during a build (the
@@ -138,6 +139,7 @@ class ChalkSandboxEnvironment(BaseEnvironment):
             disable_internet=True,
             network_allowlist=True,
             network_allowlist_hostnames=True,
+            network_allowlist_wildcard_hostnames=True,
             network_allowlist_ipv4_addresses=True,
             network_allowlist_ipv4_cidrs=True,
         )
@@ -380,6 +382,7 @@ def _image_from_dockerfile(dockerfile: Path, image_map: dict[str, str]) -> Image
 
     image: Image | None = None
     commands: list[str] = []
+    source_sizes: list[tuple[str, int]] = []
     for instruction in instructions:
         name, value = instruction["instruction"], instruction["value"]
         if name in ("COMMENT", "HEALTHCHECK"):
@@ -389,14 +392,37 @@ def _image_from_dockerfile(dockerfile: Path, image_map: dict[str, str]) -> Image
             base = re.split(r"\s+as\s+", value.strip(), flags=re.IGNORECASE)[0]
             image = Image.base(image_map.get(base, base))
         elif name in ("COPY", "ADD") and "--from" not in value:
-            commands.extend(_embedded_copy(context, value, dockerfile))
+            commands.extend(
+                _embedded_copy(context, value, dockerfile, source_sizes=source_sizes)
+            )
         else:
             commands.append(instruction["content"].strip())
+    total = sum(len(command.encode()) for command in commands)
+    if total > _DOCKERFILE_INSTRUCTION_BUDGET_BYTES:
+        largest = ", ".join(
+            f"{source!r} ({size} bytes)"
+            for source, size in sorted(
+                source_sizes, key=lambda item: item[1], reverse=True
+            )[:5]
+        )
+        raise ValueError(
+            f"{dockerfile}: translated Dockerfile instructions total {total} bytes, over the "
+            f"{_DOCKERFILE_INSTRUCTION_BUDGET_BYTES}-byte instruction budget; "
+            f"largest COPY/ADD sources (instruction bytes): {largest or 'none'}; "
+            "Chalk's image builder fails silently on Dockerfiles over about 128 KiB; "
+            "mount larger data with --ek volumes=..."
+        )
     assert image is not None
     return image.dockerfile_commands(commands) if commands else image
 
 
-def _embedded_copy(context: Path, value: str, dockerfile: Path) -> list[str]:
+def _embedded_copy(
+    context: Path,
+    value: str,
+    dockerfile: Path,
+    *,
+    source_sizes: list[tuple[str, int]] | None = None,
+) -> list[str]:
     """Render ``COPY <src>... <dest>`` as RUN steps that unpack an embedded tarball.
 
     Follows Docker's rules: a directory source copies its contents into dest, a file
@@ -409,6 +435,7 @@ def _embedded_copy(context: Path, value: str, dockerfile: Path) -> list[str]:
     into_dir = dest.endswith("/") or len(sources) > 1
     steps: list[str] = []
     for source in sources:
+        first_step = len(steps)
         src = (context / source).resolve()
         if not src.is_relative_to(context.resolve()):
             raise ValueError(
@@ -434,17 +461,37 @@ def _embedded_copy(context: Path, value: str, dockerfile: Path) -> list[str]:
                         PurePosixPath(dest).name,
                     )
         payload = buffer.getvalue()
-        if len(payload) > _EMBED_BUDGET_BYTES:
-            raise ValueError(
-                f"{dockerfile}: COPY {source!r} is {len(payload)} bytes compressed, over the "
-                f"{_EMBED_BUDGET_BYTES}-byte embed budget; mount it with --ek volumes=... instead"
-            )
         encoded = base64.b64encode(payload).decode()
+        temp_dir = f"/tmp/.harbor-copy-{hashlib.sha256(payload).hexdigest()}"
+        commands = [f"mkdir -p {temp_dir}"]
+        # Separate files avoid storing a growing payload in every layer. Three chunks
+        # per RUN stay under sh's 128 KiB argument limit and Docker's line limit.
+        for offset in range(0, len(encoded), 32 * 1024):
+            commands.append(
+                f"printf %s '{encoded[offset : offset + 32 * 1024]}'"
+                f" > {temp_dir}/{offset // (32 * 1024):04d}"
+            )
+            if offset // (32 * 1024) % 3 == 2 or offset + 32 * 1024 >= len(encoded):
+                steps.append("RUN " + " \\\n    && ".join(commands))
+                commands = []
         unpack_dir = shlex.quote(target_dir)
-        script = f"mkdir -p {unpack_dir} && echo {encoded} | base64 -d | tar -xz -C {unpack_dir}"
+        script = f"mkdir -p {unpack_dir}"
         if rename is not None and rename != src.name:
-            script += f" && mv {shlex.quote(f'{target_dir}/{src.name}')} {shlex.quote(f'{target_dir}/{rename}')}"
+            script += " && copy_dir=$(mktemp -d)"
+            unpack_dir = '"$copy_dir"'
+        script += f" && cat {temp_dir}/* | base64 -d | tar -xz -C {unpack_dir}"
+        if rename is not None and rename != src.name:
+            script += (
+                f' && mv "$copy_dir"/{shlex.quote(src.name)}'
+                f" {shlex.quote(f'{target_dir}/{rename}')}"
+                ' && rmdir "$copy_dir"'
+            )
+        script += f" && rm -rf {temp_dir}"
         steps.append(f"RUN {script}")
+        if source_sizes is not None:
+            source_sizes.append(
+                (source, sum(len(step.encode()) for step in steps[first_step:]))
+            )
     return steps
 
 

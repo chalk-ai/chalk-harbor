@@ -35,8 +35,19 @@ that a Dockerfile `COPY`, followed by a `RUN` that reads the copied file, builds
 
 - **Image:** a task's `docker_image` is used as-is. A single-stage `environment/Dockerfile` is
   translated into a chalkcompute `Image`: `FROM` becomes the base and every other instruction is
-  replayed in order. `COPY`/`ADD` build context is embedded as a base64 tarball inside a `RUN`
-  step (up to 4 MiB compressed per `COPY`), so later `RUN` steps can see the files.
+  replayed in order. `COPY`/`ADD` build context is embedded as a base64 tarball across `RUN`
+  steps (32 KiB base64 chunks grouped three per `RUN`), so later `RUN` steps can see the
+  files. Chunking keeps physical lines below Docker's 64 KB limit. All translated
+  instructions together must fit in 120 KiB (122,880 bytes). Embedded files may total
+  about 120 KiB of base64 (roughly 88 KiB of compressed data), with room needed for
+  instruction overhead. Mount larger data as a volume with `--ek volumes=...`.
+  Chalk staging builds on 2026-11-02 exposed these limits:
+
+  - About 128 KiB for the whole Dockerfile: silent kill (`build-image: Error (exit code 143)`), tracked in CHA-12015.
+  - 1 MiB compressed workflow.
+  - 2 MiB gRPC message (`ResourceExhausted`).
+  - 3 MiB request entity (`Request entity too large`).
+
 - **Exec:** commands run through `bash` when the image has it and `sh` otherwise, as the requested
   user.
 - **File transfer:** directories move as one tar archive in each direction, which preserves
