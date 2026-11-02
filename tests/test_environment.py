@@ -21,7 +21,7 @@ def _run_steps(steps):
 def test_large_copy(tmp_path):
     source = tmp_path / "context"
     source.mkdir()
-    data = os.urandom(300 * 1024)
+    data = os.urandom(int(3.9 * 1024 * 1024))
     (source / "data.bin").write_bytes(data)
     (source / "nested").mkdir()
     (source / "nested" / "hello.txt").write_text("hello\n")
@@ -31,8 +31,30 @@ def test_large_copy(tmp_path):
         tmp_path, f"context {shlex.quote(str(dest))}", tmp_path / "Dockerfile"
     )
 
-    assert all(len(step.encode()) < 65535 for step in steps)
-    _run_steps(steps)
+    assert 56 <= len(steps) <= 60
+    assert all(1 <= step.count("printf %s") <= 3 for step in steps[:-1])
+    assert all(len(step[4:].encode()) < 128 * 1024 for step in steps)
+    assert all(
+        len(line.encode()) < 65535 for step in steps for line in step.splitlines()
+    )
+    steps = [
+        step.replace("/tmp/.harbor-copy-", f"{tmp_path}/.harbor-copy-")
+        for step in steps
+    ]
+    _run_steps(steps[:-1])
+    [chunk_dir] = tmp_path.glob(".harbor-copy-*")
+    chunks = sorted(chunk_dir.iterdir())
+    assert all(chunk.stat().st_size <= 32 * 1024 for chunk in chunks)
+    assert [chunk.name for chunk in chunks] == [
+        f"{index:04d}" for index in range(len(chunks))
+    ]
+    assert len(steps) == (len(chunks) + 2) // 3 + 1
+    assert len(data) * 4 / 3 <= sum(chunk.stat().st_size for chunk in chunks)
+    assert (
+        sum(chunk.stat().st_size for chunk in chunks) <= _EMBED_BUDGET_BYTES * 4 / 3 + 4
+    )
+    _run_steps(steps[-1:])
+    assert not chunk_dir.exists()
     assert (dest / "data.bin").read_bytes() == data
     assert (dest / "nested" / "hello.txt").read_text() == "hello\n"
 
@@ -51,7 +73,9 @@ def test_renamed_copy_preserves_existing_file(tmp_path):
 
     _run_steps(
         _embedded_copy(
-            tmp_path, f"agent.py {shlex.quote(str(dest / 'scoped_router.py'))}", dockerfile
+            tmp_path,
+            f"agent.py {shlex.quote(str(dest / 'scoped_router.py'))}",
+            dockerfile,
         )
     )
 

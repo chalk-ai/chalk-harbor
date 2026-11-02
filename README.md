@@ -36,8 +36,9 @@ that a Dockerfile `COPY`, followed by a `RUN` that reads the copied file, builds
 - **Image:** a task's `docker_image` is used as-is. A single-stage `environment/Dockerfile` is
   translated into a chalkcompute `Image`: `FROM` becomes the base and every other instruction is
   replayed in order. `COPY`/`ADD` build context is embedded as a base64 tarball across `RUN`
-  steps (up to 4 MiB compressed per source, in 32 KiB base64 chunks to stay below Docker's
-  line limit), so later `RUN` steps can see the files.
+  steps (up to 4 MiB compressed per source, in 32 KiB base64 chunks grouped three per
+  `RUN`), so later `RUN` steps can see the files. Mount larger sources as volumes with
+  `--ek volumes=...`.
 - **Exec:** commands run through `bash` when the image has it and `sh` otherwise, as the requested
   user.
 - **File transfer:** directories move as one tar archive in each direction, which preserves
