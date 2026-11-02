@@ -6,9 +6,10 @@ import pytest
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 
 from chalk_harbor.environment import (
-    _EMBED_BUDGET_BYTES,
+    _DOCKERFILE_INSTRUCTION_BUDGET_BYTES,
     ChalkSandboxEnvironment,
     _embedded_copy,
+    _image_from_dockerfile,
 )
 
 
@@ -50,9 +51,6 @@ def test_large_copy(tmp_path):
     ]
     assert len(steps) == (len(chunks) + 2) // 3 + 1
     assert len(data) * 4 / 3 <= sum(chunk.stat().st_size for chunk in chunks)
-    assert (
-        sum(chunk.stat().st_size for chunk in chunks) <= _EMBED_BUDGET_BYTES * 4 / 3 + 4
-    )
     _run_steps(steps[-1:])
     assert not chunk_dir.exists()
     assert (dest / "data.bin").read_bytes() == data
@@ -108,8 +106,78 @@ def test_copy_instructions_are_deterministic(tmp_path, monkeypatch):
     )
 
 
-def test_copy_embed_budget(tmp_path):
-    (tmp_path / "data.bin").write_bytes(os.urandom(_EMBED_BUDGET_BYTES + 1))
+@pytest.mark.parametrize("offset", [-1, 1])
+def test_copy_instruction_budget_boundary(tmp_path, offset):
+    assert _DOCKERFILE_INSTRUCTION_BUDGET_BYTES == 122_880
+    (tmp_path / "data.bin").write_bytes(
+        os.urandom((_DOCKERFILE_INSTRUCTION_BUDGET_BYTES - 4096) * 3 // 4)
+    )
+    dockerfile = tmp_path / "Dockerfile"
+    steps = _embedded_copy(tmp_path, "data.bin /data.bin", dockerfile)
+    copy_total = sum(len(step.encode()) for step in steps)
+    assert 64 * 1024 < copy_total < _DOCKERFILE_INSTRUCTION_BUDGET_BYTES
+    label = "LABEL data="
+    padding = _DOCKERFILE_INSTRUCTION_BUDGET_BYTES + offset - copy_total - len(label)
+    dockerfile.write_text(
+        "FROM ubuntu:24.04\nCOPY data.bin /data.bin\n" + label + "x" * padding + "\n"
+    )
 
-    with pytest.raises(ValueError, match="over the .* embed budget"):
-        _embedded_copy(tmp_path, "data.bin /data.bin", tmp_path / "Dockerfile")
+    if offset > 0:
+        with pytest.raises(ValueError) as exc:
+            _image_from_dockerfile(dockerfile, {})
+        message = str(exc.value)
+        assert "total 122881 bytes" in message
+        assert "122880-byte instruction budget" in message
+        assert (
+            "Chalk's image builder fails silently on Dockerfiles over about 128 KiB; "
+            "mount larger data with --ek volumes=..."
+        ) in message
+        return
+
+    image = _image_from_dockerfile(dockerfile, {})
+
+    commands = image._steps[0].step.value.commands
+    total = sum(len(command.encode()) for command in commands)
+    assert total == _DOCKERFILE_INSTRUCTION_BUDGET_BYTES - 1
+
+
+def test_multiple_copies_exceed_instruction_budget(tmp_path):
+    for source in ("first.bin", "second.bin"):
+        (tmp_path / source).write_bytes(os.urandom(48 * 1024))
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM ubuntu:24.04\nCOPY first.bin /first.bin\nCOPY second.bin /second.bin\n"
+    )
+    source_totals = [
+        sum(
+            len(step.encode())
+            for step in _embedded_copy(tmp_path, f"{source} /{source}", dockerfile)
+        )
+        for source in ("first.bin", "second.bin")
+    ]
+    assert all(total < _DOCKERFILE_INSTRUCTION_BUDGET_BYTES for total in source_totals)
+    expected_total = sum(source_totals)
+    assert expected_total > _DOCKERFILE_INSTRUCTION_BUDGET_BYTES
+
+    with pytest.raises(ValueError) as exc:
+        _image_from_dockerfile(dockerfile, {})
+
+    message = str(exc.value)
+    assert f"total {expected_total} bytes" in message
+    assert f"{_DOCKERFILE_INSTRUCTION_BUDGET_BYTES}-byte instruction budget" in message
+    assert "first.bin" in message
+    assert "second.bin" in message
+    assert "--ek volumes=..." in message
+
+
+def test_other_instructions_count_toward_budget(tmp_path):
+    dockerfile = tmp_path / "Dockerfile"
+    # UTF-8 byte count, including non-RUN instructions.
+    dockerfile.write_text(
+        'FROM ubuntu:24.04\nLABEL data="'
+        + "é" * (_DOCKERFILE_INSTRUCTION_BUDGET_BYTES // 2)
+        + '"\n'
+    )
+
+    with pytest.raises(ValueError, match="instruction budget"):
+        _image_from_dockerfile(dockerfile, {})
