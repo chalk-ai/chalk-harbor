@@ -180,6 +180,18 @@ def _check_cpu(value: Any) -> None:
             _check_cpu(item)
 
 
+def _check_target_cpu(model: Any, optimizer: Any, scheduler: Any) -> None:
+    # Check actual destination tensors, including nonpersistent buffers and optimizer
+    # parameters, as well as state_dicts. map_location only constrains saved payloads;
+    # CPU load_state_dict into meta targets can warn and silently leave them meta.
+    _check_cpu(list(model.parameters()))
+    _check_cpu(list(model.buffers()))
+    _check_cpu(optimizer.param_groups)
+    _check_cpu(model.state_dict())
+    _check_cpu(optimizer.state_dict())
+    _check_cpu(scheduler.state_dict())
+
+
 def _fsync_dir(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -224,6 +236,7 @@ def save_checkpoint(
 
     _cpu_only()
     identity_doc = identity.document()
+    _check_target_cpu(model, optimizer, scheduler)
     topology = _topology(model, optimizer, scheduler)
     payload = {
         "model": model.state_dict(),
@@ -277,6 +290,7 @@ def restore_checkpoint(
 
     _cpu_only()
     expected_doc = expected.document()
+    _check_target_cpu(model, optimizer, scheduler)
     if path.is_symlink() or not path.is_dir():
         raise CheckpointError("checkpoint must be a regular directory")
     if {p.name for p in path.iterdir()} != {"state.pt", "COMPLETE.json"}:

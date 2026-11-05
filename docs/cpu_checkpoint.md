@@ -34,7 +34,7 @@ only local completeness, not a durable ChalkFS snapshot or operation result.
 
 `restore_checkpoint(..., expected=identity, manifest_sha256=digest, ...)` requires the
 exact expected identity and trusted manifest digest. It checks all filenames, regular-file
-status, canonical manifest bytes, payload hash/size, topology, Torch version, CPU state,
+status, canonical manifest bytes, payload hash/size, topology, Torch version, CPU payload and destination state,
 RNG and model keys/shapes/dtypes before calling any state loading hook or changing global
 RNG. It uses `torch.load(weights_only=True)`. Restore into fresh disposable objects:
 arbitrary application `load_state_dict` hooks can still fail; object loading is not an
@@ -62,9 +62,11 @@ scheduler and RNG operations are real CPU Torch. Separate tests prove accelerato
 availability fails closed. Tests compare a resumed next step exactly, verify every
 identity field, zero presence, corrupt/missing/nonregular files, concurrent exclusive
 writers, immutable retries and actual child-process exit after state/pending-manifest
-writes and after completion before the response. Each child is bounded and reaped.
+writes and after completion before the response. Each child is bounded and reaped. Actual meta-device target regressions cover model
+parameters, nonpersistent buffers, optimizer and scheduler state: refusal calls no load
+hook and preserves all supplied object state and global RNG.
 
-Local evidence: 40 tests passed using existing Python 3.11.14 / Torch 2.15.0. Ruff lint
+Local evidence: 44 tests passed using existing Python 3.11.14 / Torch 2.15.0. Ruff lint
 and formatting pass. The project requires Python >=3.12,<3.15; this is not a
 supported-Python-version test result. No existing supported-version Torch environment
 was available. Existing LoRA integration tests require missing Harbor/PEFT/Transformers

@@ -413,3 +413,76 @@ def test_nonregular_state_is_refused_without_blocking(tmp_path, identity, cpu_on
     os.mkfifo(path / "state.pt")
     with pytest.raises(checkpoint.CheckpointError, match="regular file"):
         restore(path, identity, digest, objects())
+
+
+@pytest.mark.parametrize("target", ["model", "buffer", "optimizer", "scheduler"])
+def test_meta_destination_refused_before_any_live_mutation(
+    tmp_path, identity, cpu_only, monkeypatch, target
+):
+    def linear(device="cpu"):
+        model = torch.nn.Linear(3, 1, device=device)
+        optimizer = torch.optim.AdamW(model.parameters())
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1)
+        return model, optimizer, scheduler
+
+    path = tmp_path / "checkpoint"
+    source = linear()
+    digest = save(path, identity, source)
+    model, optimizer, scheduler = linear("meta" if target == "model" else "cpu")
+    if target == "buffer":
+        model.register_buffer(
+            "scratch", torch.empty(1, device="meta"), persistent=False
+        )
+    elif target == "optimizer":
+        optimizer.state[next(model.parameters())]["exp_avg"] = torch.empty(
+            3, device="meta"
+        )
+    elif target == "scheduler":
+        scheduler.scratch = torch.empty(1, device="meta")
+
+    def frozen(value):
+        if isinstance(value, torch.Tensor):
+            if value.device.type == "meta":
+                return (
+                    value.device,
+                    value.dtype,
+                    value.shape,
+                    value.requires_grad,
+                    value._version,
+                )
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {key: frozen(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [frozen(item) for item in value]
+        return value
+
+    def snapshot():
+        return frozen(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "buffers": dict(model.named_buffers()),
+                "parameter_flags": {
+                    name: (id(param), param.requires_grad, param._version)
+                    for name, param in model.named_parameters()
+                },
+                "modes": {
+                    name: module.training for name, module in model.named_modules()
+                },
+            }
+        )
+
+    before = snapshot()
+    rng_before = checkpoint._rng()
+    called = []
+    for obj in (model, optimizer, scheduler):
+        monkeypatch.setattr(
+            type(obj), "load_state_dict", lambda *a, **kw: called.append(True)
+        )
+    with pytest.raises(checkpoint.CheckpointError, match="only CPU tensors"):
+        restore(path, identity, digest, (model, optimizer, scheduler))
+    assert called == []
+    equal(before, snapshot())
+    equal(rng_before, checkpoint._rng())
